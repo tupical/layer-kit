@@ -9,11 +9,13 @@ license = "Apache-2.0 WITH Commons-Clause"
 path = "src/lib.rs"
 
 [dependencies]
-# `ai` is the lib-level seam shared by torii/satori/yatagarasu's lib crates:
-# zero heavy deps, so depending on layer-kit for it does not pull
-# axum/tokio/reqwest into a layer's lib dependency tree.
+# `ai` / `error` / `id` / `time` are the lib-level seam shared by every
+# layer's lib crate: zero heavy deps, so depending on layer-kit for them
+# does not pull axum/tokio/reqwest into a layer's lib dependency tree.
 serde      = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+uuid       = { version = "1.10", features = ["v7", "serde"] }
+chrono     = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 
 # `auth` / `openai` / `serve` are server-only infra, gated behind `server` so
 # lib crates never see them.
