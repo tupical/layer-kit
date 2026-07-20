@@ -188,8 +188,10 @@ async fn mcp<H: McpHandler>(
         };
     }
 
-    // ponytail: the legacy `{method, params}` envelope stays until mcpbox.ru's
-    // tool_client/v1_gateway speak tools/call; drop this branch then.
+    // ponytail: mcpbox.ru now speaks tools/call in main, but the DEPLOYED
+    // platform still sends the legacy `{method, params}` envelope. Drop this
+    // branch once the platform release is live, not before — layers deploy
+    // independently and would otherwise break the running pipeline.
     let req: McpRequest = match serde_json::from_value(req) {
         Ok(r) => r,
         Err(e) => {
