@@ -27,6 +27,11 @@ base64  = { version = "0.22", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 tracing = { version = "0.1", optional = true }
 
+# `store` is opt-in on top of `server`: a layer that persists nothing (a pure
+# transform skeleton) must not pay for sqlx.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "migrate", "macros"], optional = true }
+
 [features]
 default = []
 server = ["dep:axum", "dep:tokio", "dep:hmac", "dep:sha2", "dep:base64", "dep:reqwest", "dep:tracing"]
+storage = ["dep:sqlx", "dep:tokio"]

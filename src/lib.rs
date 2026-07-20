@@ -12,7 +12,8 @@
 //! `auth` / `openai` / `serve` are server-only infra (the platform→tool
 //! token contract, an OpenAI Responses client, and the axum/tokio server
 //! scaffold), gated behind the `server` feature and used only from each
-//! layer's `server` binary crate.
+//! layer's `server` binary crate. `store` (feature `storage`) is the SQLite
+//! object+event persistence a layer opts into when it must survive a restart.
 
 pub mod ai;
 pub mod time;
@@ -26,3 +27,5 @@ pub mod auth;
 pub mod openai;
 #[cfg(feature = "server")]
 pub mod serve;
+#[cfg(feature = "storage")]
+pub mod store;
