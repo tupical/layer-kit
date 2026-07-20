@@ -53,6 +53,23 @@ pub trait McpHandler: Send + Sync + 'static {
         method: &str,
         params: serde_json::Value,
     ) -> impl Future<Output = Result<serde_json::Value, (StatusCode, serde_json::Value)>> + Send;
+
+    /// Tool descriptors for `tools/list` (`{name, description, inputSchema}`).
+    /// Names are underscored (`torii_parse`) because MCP clients reject dots;
+    /// [`dispatch_method`] maps them back onto dispatch methods
+    /// (`torii.parse`).
+    fn tools(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+}
+
+/// `torii_parse` → `torii.parse`; anything else passes through unchanged
+/// (a layer may already name its tools with dots).
+fn dispatch_method(tool: &str, name: &str) -> String {
+    match name.strip_prefix(&format!("{tool}_")) {
+        Some(rest) => format!("{tool}.{rest}"),
+        None => name.to_string(),
+    }
 }
 
 struct ServeState<H> {
@@ -151,7 +168,29 @@ async fn mcp<H: McpHandler>(
     };
 
     // Auth passed — dispatch the MCP method against the layer's own handler.
-    let req: McpRequest = match serde_json::from_slice(&body) {
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "bad_request", "detail": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    // Real MCP (JSON-RPC 2.0) — what Claude/Cursor speak.
+    if req.get("jsonrpc").is_some() {
+        return match rpc(&s.handler, s.tool, &s.version, &claims, req).await {
+            Some(resp) => Json(resp).into_response(),
+            // Notification (no id): nothing to answer.
+            None => StatusCode::ACCEPTED.into_response(),
+        };
+    }
+
+    // ponytail: the legacy `{method, params}` envelope stays until mcpbox.ru's
+    // tool_client/v1_gateway speak tools/call; drop this branch then.
+    let req: McpRequest = match serde_json::from_value(req) {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -174,10 +213,151 @@ async fn mcp<H: McpHandler>(
     }
 }
 
-/// One MCP call: `{ "method": "<tool>.<op>", "params": { ... } }`.
+/// One legacy MCP call: `{ "method": "<tool>.<op>", "params": { ... } }`.
 #[derive(serde::Deserialize)]
 struct McpRequest {
     method: String,
     #[serde(default)]
     params: serde_json::Value,
+}
+
+/// MCP protocol revision this scaffold implements.
+const PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// Handle one JSON-RPC frame. `None` = notification (nothing to send back).
+/// Protocol-level failures come back as JSON-RPC errors with HTTP 200, per
+/// the spec; only auth failures are HTTP errors.
+async fn rpc<H: McpHandler>(
+    handler: &H,
+    tool: &'static str,
+    version: &str,
+    claims: &Claims,
+    req: serde_json::Value,
+) -> Option<serde_json::Value> {
+    let id = req.get("id").filter(|v| !v.is_null()).cloned()?;
+    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+    let reply = |result| json!({"jsonrpc": "2.0", "id": id, "result": result});
+    let fail = |code: i32, message: String| {
+        json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+    };
+
+    Some(match method {
+        "initialize" => reply(json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": tool, "version": version},
+        })),
+        "ping" => reply(json!({})),
+        "tools/list" => reply(json!({"tools": handler.tools()})),
+        "tools/call" => {
+            let Some(name) = params.get("name").and_then(|n| n.as_str()) else {
+                return Some(fail(-32602, "tools/call requires `name`".into()));
+            };
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            // A tool that fails is a result with isError, not a protocol error:
+            // the model must see the failure to react to it.
+            let (payload, is_error) =
+                match handler.dispatch(claims, &dispatch_method(tool, name), args).await {
+                    Ok(result) => (result, false),
+                    Err((_, err)) => (err, true),
+                };
+            reply(json!({
+                "content": [{"type": "text", "text": payload.to_string()}],
+                "structuredContent": payload,
+                "isError": is_error,
+            }))
+        }
+        other => fail(-32601, format!("method not found: {other}")),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fake;
+
+    impl McpHandler for Fake {
+        async fn dispatch(
+            &self,
+            _claims: &Claims,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+            match method {
+                "test.echo" => Ok(json!({"echo": params})),
+                other => Err((
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": "unknown_method", "detail": other}),
+                )),
+            }
+        }
+
+        fn tools(&self) -> Vec<serde_json::Value> {
+            vec![json!({"name": "test_echo", "description": "echo", "inputSchema": {"type": "object"}})]
+        }
+    }
+
+    fn claims() -> Claims {
+        Claims {
+            workspace: "ws1".into(),
+            project: None,
+            tool: "test".into(),
+            exp: 0,
+        }
+    }
+
+    async fn call(req: serde_json::Value) -> Option<serde_json::Value> {
+        rpc(&Fake, "test", "0.1.0", &claims(), req).await
+    }
+
+    #[tokio::test]
+    async fn handshake_list_and_call() {
+        let init = call(json!({"jsonrpc":"2.0","id":1,"method":"initialize"}))
+            .await
+            .unwrap();
+        assert_eq!(init["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(init["result"]["serverInfo"]["name"], "test");
+
+        let list = call(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+            .await
+            .unwrap();
+        assert_eq!(list["result"]["tools"][0]["name"], "test_echo");
+
+        // Underscored tool name must reach the dotted dispatch method.
+        let out = call(json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+                              "params":{"name":"test_echo","arguments":{"x":1}}}))
+            .await
+            .unwrap();
+        assert_eq!(out["result"]["isError"], false);
+        assert_eq!(out["result"]["structuredContent"]["echo"]["x"], 1);
+        assert!(out["result"]["content"][0]["text"].as_str().unwrap().contains("\"x\":1"));
+    }
+
+    #[tokio::test]
+    async fn notification_unknown_method_and_tool_failure() {
+        assert!(
+            call(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+                .await
+                .is_none(),
+            "notifications get no response"
+        );
+
+        let bad = call(json!({"jsonrpc":"2.0","id":1,"method":"nope"}))
+            .await
+            .unwrap();
+        assert_eq!(bad["error"]["code"], -32601);
+
+        // A failing tool is a result with isError, not a JSON-RPC error.
+        let failed = call(json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                                 "params":{"name":"test_missing"}}))
+            .await
+            .unwrap();
+        assert_eq!(failed["result"]["isError"], true);
+        assert_eq!(failed["result"]["structuredContent"]["error"], "unknown_method");
+    }
 }
