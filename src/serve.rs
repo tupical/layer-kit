@@ -179,48 +179,20 @@ async fn mcp<H: McpHandler>(
         }
     };
 
-    // Real MCP (JSON-RPC 2.0) — what Claude/Cursor speak.
-    if req.get("jsonrpc").is_some() {
-        return match rpc(&s.handler, s.tool, &s.version, &claims, req).await {
-            Some(resp) => Json(resp).into_response(),
-            // Notification (no id): nothing to answer.
-            None => StatusCode::ACCEPTED.into_response(),
-        };
+    // MCP (JSON-RPC 2.0) is the only wire format — what Claude/Cursor and the
+    // platform speak. The legacy `{method, params}` envelope is gone.
+    if req.get("jsonrpc").is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "bad_request", "detail": "expected JSON-RPC 2.0 request"})),
+        )
+            .into_response();
     }
-
-    // ponytail: mcpbox.ru now speaks tools/call in main, but the DEPLOYED
-    // platform still sends the legacy `{method, params}` envelope. Drop this
-    // branch once the platform release is live, not before — layers deploy
-    // independently and would otherwise break the running pipeline.
-    let req: McpRequest = match serde_json::from_value(req) {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "bad_request", "detail": e.to_string()})),
-            )
-                .into_response();
-        }
-    };
-    match s.handler.dispatch(&claims, &req.method, req.params).await {
-        Ok(mut result) => {
-            // Stamp the token-scoped call context onto the response envelope.
-            result["tool"] = json!(s.tool);
-            result["version"] = json!(s.version);
-            result["workspace"] = json!(claims.workspace);
-            result["project"] = json!(claims.project);
-            Json(result).into_response()
-        }
-        Err((code, payload)) => (code, Json(payload)).into_response(),
+    match rpc(&s.handler, s.tool, &s.version, &claims, req).await {
+        Some(resp) => Json(resp).into_response(),
+        // Notification (no id): nothing to answer.
+        None => StatusCode::ACCEPTED.into_response(),
     }
-}
-
-/// One legacy MCP call: `{ "method": "<tool>.<op>", "params": { ... } }`.
-#[derive(serde::Deserialize)]
-struct McpRequest {
-    method: String,
-    #[serde(default)]
-    params: serde_json::Value,
 }
 
 /// MCP protocol revision this scaffold implements.
