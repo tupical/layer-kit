@@ -6,6 +6,7 @@
 //! daruma's Responses API client. This is the only seam a layer's lib
 //! exposes to the outside world for AI calls.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 
@@ -80,6 +81,27 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// Token accounting returned by an AI provider when available.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+}
+
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+pub(crate) fn parse_usage(body: &Value) -> Option<AiUsage> {
+    let usage = body.get("usage")?.as_object()?;
+    Some(AiUsage {
+        input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
+        output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
+        total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
+    })
+}
+
 /// Error raised by an [`AiProvider`].
 #[derive(Debug, Clone)]
 pub struct AiError(pub String);
@@ -109,6 +131,13 @@ impl std::error::Error for AiError {}
 #[allow(async_fn_in_trait)]
 pub trait AiProvider: Send + Sync {
     async fn respond(&self, req: AiRequest) -> Result<Vec<AiOutput>, AiError>;
+
+    async fn respond_with_usage(
+        &self,
+        req: AiRequest,
+    ) -> Result<(Vec<AiOutput>, Option<AiUsage>), AiError> {
+        Ok((self.respond(req).await?, None))
+    }
 }
 
 // ── Prompt-injection hardening ──────────────────────────────────────────
@@ -154,6 +183,56 @@ pub fn wrap_untrusted(label: &str, content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        future::Future,
+        sync::Arc,
+        task::{Context, Poll, Wake, Waker},
+    };
+
+    struct MinimalProvider;
+
+    impl AiProvider for MinimalProvider {
+        async fn respond(&self, _req: AiRequest) -> Result<Vec<AiOutput>, AiError> {
+            Ok(vec![])
+        }
+    }
+
+    fn ready<F: Future>(future: F) -> F::Output {
+        struct Noop;
+        impl Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = Waker::from(Arc::new(Noop));
+        let mut future = Box::pin(future);
+        match future.as_mut().poll(&mut Context::from_waker(&waker)) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("test future unexpectedly pending"),
+        }
+    }
+
+    #[test]
+    fn default_respond_with_usage_returns_none() {
+        let request = AiRequest {
+            input: Value::Null,
+            tools: vec![],
+            tool_choice: None,
+        };
+        let (_, usage) = ready(MinimalProvider.respond_with_usage(request)).unwrap();
+        assert_eq!(usage, None);
+    }
+
+    #[test]
+    fn parses_responses_usage() {
+        let usage = parse_usage(&serde_json::json!({
+            "id": "resp_fixture",
+            "output": [],
+            "usage": {"input_tokens": 123, "output_tokens": 45, "total_tokens": 168}
+        }))
+        .unwrap();
+        assert_eq!(usage.input_tokens, Some(123));
+        assert_eq!(usage.output_tokens, Some(45));
+        assert_eq!(usage.total_tokens, Some(168));
+    }
 
     #[test]
     fn wrap_untrusted_fences_content() {

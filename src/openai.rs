@@ -12,7 +12,7 @@
 use serde_json::{json, Value};
 
 pub use crate::ai::AiConfig;
-use crate::ai::{AiError, AiOutput, AiProvider, AiRequest, ToolCall};
+use crate::ai::{parse_usage, AiError, AiOutput, AiProvider, AiRequest, AiUsage, ToolCall};
 
 /// [`AiProvider`] backed by the OpenAI Responses API. Clone is cheap (the
 /// inner `reqwest::Client` is Arc-backed).
@@ -29,10 +29,21 @@ impl OpenAiProvider {
             cfg,
         }
     }
+
+    pub fn model(&self) -> &str {
+        &self.cfg.model
+    }
 }
 
 impl AiProvider for OpenAiProvider {
     async fn respond(&self, req: AiRequest) -> Result<Vec<AiOutput>, AiError> {
+        Ok(self.respond_with_usage(req).await?.0)
+    }
+
+    async fn respond_with_usage(
+        &self,
+        req: AiRequest,
+    ) -> Result<(Vec<AiOutput>, Option<AiUsage>), AiError> {
         let body = build_request_body(&self.cfg.model, &req);
         let resp = self
             .http
@@ -53,7 +64,7 @@ impl AiProvider for OpenAiProvider {
             .json()
             .await
             .map_err(|e| AiError::new(format!("responses decode failed: {e}")))?;
-        parse_outputs(&body)
+        Ok((parse_outputs(&body)?, parse_usage(&body)))
     }
 }
 
