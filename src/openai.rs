@@ -11,34 +11,8 @@
 
 use serde_json::{json, Value};
 
+pub use crate::ai::AiConfig;
 use crate::ai::{AiError, AiOutput, AiProvider, AiRequest, ToolCall};
-
-/// Settings the provider needs to reach the Responses API.
-#[derive(Clone, Debug)]
-pub struct AiConfig {
-    pub api_key: String,
-    pub base_url: String,
-    pub model: String,
-}
-
-impl AiConfig {
-    /// Load from env; `None` when `OPENAI_API_KEY` is unset or empty.
-    pub fn from_env() -> Option<Self> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty())?;
-        Some(Self {
-            api_key,
-            base_url: std::env::var("OPENAI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
-            model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1".into()),
-        })
-    }
-
-    fn responses_url(&self) -> String {
-        format!("{}/responses", self.base_url)
-    }
-}
 
 /// [`AiProvider`] backed by the OpenAI Responses API. Clone is cheap (the
 /// inner `reqwest::Client` is Arc-backed).

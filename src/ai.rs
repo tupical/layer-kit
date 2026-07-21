@@ -9,6 +9,47 @@
 use serde_json::Value;
 use std::fmt;
 
+/// Settings a concrete OpenAI-compatible provider needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AiConfig {
+    pub api_key: String,
+    pub base_url: String,
+    pub model: String,
+}
+
+impl AiConfig {
+    /// Load the layer's process-wide fallback configuration.
+    pub fn from_env() -> Option<Self> {
+        let api_key = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        Some(Self {
+            api_key,
+            base_url: std::env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
+            model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1".into()),
+        })
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn responses_url(&self) -> String {
+        format!("{}/responses", self.base_url)
+    }
+}
+
+/// Remove a request-scoped AI secret before any domain processing.
+/// Invalid or incomplete blocks are removed and treated as absent.
+pub fn extract_ai_config(arguments: &mut Value) -> Option<AiConfig> {
+    let ai = arguments.as_object_mut()?.remove("ai")?;
+    let ai = ai.as_object()?;
+    let field = |name| ai.get(name)?.as_str().filter(|s| !s.trim().is_empty());
+    Some(AiConfig {
+        api_key: field("api_key")?.to_owned(),
+        base_url: field("base_url")?.to_owned(),
+        model: field("model")?.to_owned(),
+    })
+}
+
 // ── Request / response data ─────────────────────────────────────────────
 
 /// A Responses-style request: a rendered prompt plus the function tools
@@ -130,5 +171,33 @@ mod tests {
         assert_eq!(w.matches(UNTRUSTED_CLOSE).count(), 1);
         assert!(w.ends_with(UNTRUSTED_CLOSE));
         assert!(w.contains("<\\/untrusted_data>"));
+    }
+
+    #[test]
+    fn extracts_and_removes_ai_config() {
+        let mut arguments = serde_json::json!({
+            "body": "material",
+            "ai": {"api_key": "secret", "base_url": "https://ai.test/v1", "model": "test"}
+        });
+        let cfg = extract_ai_config(&mut arguments).expect("valid config");
+        assert_eq!(cfg.api_key, "secret");
+        assert_eq!(arguments, serde_json::json!({"body": "material"}));
+    }
+
+    #[test]
+    fn absent_ai_config_is_none() {
+        let mut arguments = serde_json::json!({"body": "material"});
+        assert!(extract_ai_config(&mut arguments).is_none());
+        assert_eq!(arguments, serde_json::json!({"body": "material"}));
+    }
+
+    #[test]
+    fn invalid_ai_config_is_removed() {
+        let mut arguments = serde_json::json!({
+            "body": "material",
+            "ai": {"api_key": "", "base_url": "https://ai.test/v1", "model": 1}
+        });
+        assert!(extract_ai_config(&mut arguments).is_none());
+        assert_eq!(arguments, serde_json::json!({"body": "material"}));
     }
 }

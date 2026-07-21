@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cd /home/av/projects/meisei/torii && cargo build -q --package torii-server 2>&1 | tail -3; git add -A src migrations Cargo.toml && git status --short && git commit -q -m \\\"$(cat <<'EOF'\\nf...",
+  "error": "Exit code 128\nfatal: pathspec 'migrations' did not match any files",
+  "timestamp": "2026-07-20T09:25:24.944Z",
+  "retry_count": 1
+}
