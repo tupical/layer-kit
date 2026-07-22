@@ -16,6 +16,11 @@ pub struct AiConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    /// Cap on response tokens sent as `max_output_tokens`. `None` falls back
+    /// to [`crate::openai::DEFAULT_MAX_OUTPUT_TOKENS`]. Always sent: proxy
+    /// billers (e.g. ProxyAPI) reserve the model's maximum otherwise, which
+    /// rejects cheap calls on a low balance.
+    pub max_output_tokens: Option<u32>,
 }
 
 impl AiConfig {
@@ -29,6 +34,9 @@ impl AiConfig {
             base_url: std::env::var("OPENAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
             model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1".into()),
+            max_output_tokens: std::env::var("OPENAI_MAX_OUTPUT_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
         })
     }
 
@@ -48,6 +56,10 @@ pub fn extract_ai_config(arguments: &mut Value) -> Option<AiConfig> {
         api_key: field("api_key")?.to_owned(),
         base_url: field("base_url")?.to_owned(),
         model: field("model")?.to_owned(),
+        max_output_tokens: ai
+            .get("max_output_tokens")
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok()),
     })
 }
 
