@@ -10,6 +10,41 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 
+/// Wire protocol the provider speaks. Mirrors the daruma ai-infra contract
+/// (`workspace_ai_provider_settings.api_protocol`): the platform sends the
+/// same string values in the request-scoped `ai` block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ApiProtocol {
+    /// OpenAI Responses API (`POST {base}/responses`). The historical default.
+    #[default]
+    Responses,
+    /// OpenAI Chat Completions (`POST {base}/chat/completions`) — what most
+    /// OpenAI-compatible proxies actually implement.
+    ChatCompletions,
+}
+
+impl ApiProtocol {
+    /// Parse the wire value. `None` for unknown values — callers must reject
+    /// the config rather than silently falling back to a protocol the
+    /// provider may not speak.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "responses" => Some(Self::Responses),
+            "chat_completions" => Some(Self::ChatCompletions),
+            _ => None,
+        }
+    }
+}
+
+/// Unknown `api_protocol` is a config error, not a fallback: surface it where
+/// the operator will see it (the same policy as cloud-api's tenant_oss).
+fn log_unknown_protocol(source: &str, value: &str) {
+    #[cfg(feature = "server")]
+    tracing::error!(source, value, "unknown ai api_protocol — ai config rejected");
+    #[cfg(not(feature = "server"))]
+    eprintln!("unknown ai api_protocol {value:?} from {source} — ai config rejected");
+}
+
 /// Settings a concrete OpenAI-compatible provider needs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AiConfig {
@@ -21,6 +56,9 @@ pub struct AiConfig {
     /// billers (e.g. ProxyAPI) reserve the model's maximum otherwise, which
     /// rejects cheap calls on a low balance.
     pub max_output_tokens: Option<u32>,
+    /// Which endpoint/body dialect to speak. Missing on the wire = Responses
+    /// (backward compatibility with senders that predate the field).
+    pub api_protocol: ApiProtocol,
 }
 
 impl AiConfig {
@@ -29,6 +67,16 @@ impl AiConfig {
         let api_key = std::env::var("OPENAI_API_KEY")
             .ok()
             .filter(|s| !s.is_empty())?;
+        let api_protocol = match std::env::var("OPENAI_API_PROTOCOL") {
+            Ok(raw) if !raw.trim().is_empty() => match ApiProtocol::parse(raw.trim()) {
+                Some(protocol) => protocol,
+                None => {
+                    log_unknown_protocol("OPENAI_API_PROTOCOL", raw.trim());
+                    return None;
+                }
+            },
+            _ => ApiProtocol::default(),
+        };
         Some(Self {
             api_key,
             base_url: std::env::var("OPENAI_BASE_URL")
@@ -37,12 +85,18 @@ impl AiConfig {
             max_output_tokens: std::env::var("OPENAI_MAX_OUTPUT_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok()),
+            api_protocol,
         })
     }
 
     #[cfg(feature = "server")]
     pub(crate) fn responses_url(&self) -> String {
         format!("{}/responses", self.base_url)
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn chat_completions_url(&self) -> String {
+        format!("{}/chat/completions", self.base_url)
     }
 }
 
@@ -52,6 +106,16 @@ pub fn extract_ai_config(arguments: &mut Value) -> Option<AiConfig> {
     let ai = arguments.as_object_mut()?.remove("ai")?;
     let ai = ai.as_object()?;
     let field = |name| ai.get(name)?.as_str().filter(|s| !s.trim().is_empty());
+    let api_protocol = match field("api_protocol") {
+        None => ApiProtocol::default(),
+        Some(raw) => match ApiProtocol::parse(raw.trim()) {
+            Some(protocol) => protocol,
+            None => {
+                log_unknown_protocol("ai.api_protocol", raw);
+                return None;
+            }
+        },
+    };
     Some(AiConfig {
         api_key: field("api_key")?.to_owned(),
         base_url: field("base_url")?.to_owned(),
@@ -60,6 +124,7 @@ pub fn extract_ai_config(arguments: &mut Value) -> Option<AiConfig> {
             .get("max_output_tokens")
             .and_then(Value::as_u64)
             .and_then(|v| u32::try_from(v).ok()),
+        api_protocol,
     })
 }
 
@@ -107,9 +172,17 @@ pub struct AiUsage {
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub(crate) fn parse_usage(body: &Value) -> Option<AiUsage> {
     let usage = body.get("usage")?.as_object()?;
+    // Responses API names these input_/output_tokens; Chat Completions says
+    // prompt_/completion_tokens. Same numbers, so one parser accepts both.
+    let field = |a: &str, b: &str| {
+        usage
+            .get(a)
+            .or_else(|| usage.get(b))
+            .and_then(Value::as_u64)
+    };
     Some(AiUsage {
-        input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
-        output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
+        input_tokens: field("input_tokens", "prompt_tokens"),
+        output_tokens: field("output_tokens", "completion_tokens"),
         total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
     })
 }
@@ -290,5 +363,41 @@ mod tests {
         });
         assert!(extract_ai_config(&mut arguments).is_none());
         assert_eq!(arguments, serde_json::json!({"body": "material"}));
+    }
+
+    #[test]
+    fn api_protocol_extraction() {
+        // Отсутствие поля — Responses (обратная совместимость).
+        let mut arguments = serde_json::json!({
+            "ai": {"api_key": "k", "base_url": "https://ai.test/v1", "model": "m"}
+        });
+        let cfg = extract_ai_config(&mut arguments).unwrap();
+        assert_eq!(cfg.api_protocol, ApiProtocol::Responses);
+
+        let mut arguments = serde_json::json!({
+            "ai": {"api_key": "k", "base_url": "https://ai.test/v1", "model": "m",
+                   "api_protocol": "chat_completions"}
+        });
+        let cfg = extract_ai_config(&mut arguments).unwrap();
+        assert_eq!(cfg.api_protocol, ApiProtocol::ChatCompletions);
+
+        // Неизвестный протокол — не молчаливый фоллбэк, а отказ от конфига.
+        let mut arguments = serde_json::json!({
+            "ai": {"api_key": "k", "base_url": "https://ai.test/v1", "model": "m",
+                   "api_protocol": "grpc"}
+        });
+        assert!(extract_ai_config(&mut arguments).is_none());
+    }
+
+    #[test]
+    fn parses_chat_completions_usage_keys() {
+        let usage = parse_usage(&serde_json::json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16}
+        }))
+        .unwrap();
+        assert_eq!(usage.input_tokens, Some(12));
+        assert_eq!(usage.output_tokens, Some(4));
+        assert_eq!(usage.total_tokens, Some(16));
     }
 }

@@ -35,3 +35,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 default = []
 server = ["dep:axum", "dep:tokio", "dep:hmac", "dep:sha2", "dep:base64", "dep:reqwest", "dep:tracing"]
 storage = ["dep:sqlx", "dep:tokio"]
+
+[[test]]
+name = "chat_protocol"
+required-features = ["server"]
