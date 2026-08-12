@@ -1,0 +1,31 @@
+name: Rust
+
+# Единственный CI, гоняющий Rust в этом репозитории. До него здесь не было
+# никаких workflow вообще, а у пяти слоёв — только docs-governance с
+# paths: ["**/*.md"], то есть PR, меняющий только .rs, не запускал ничего:
+# зелёные тесты были зелены лишь локально и лишь если кто-то прогонит руками.
+on:
+  pull_request:
+    paths: ["**/*.rs", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml"]
+  push:
+    branches: [master]
+    paths: ["**/*.rs", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml"]
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      # --no-fail-fast обязателен: без него прогон обрывается на первом
+      # красном и выдаёт долю набора за полный.
+      - name: Test
+        run: cargo test --workspace --no-fail-fast
