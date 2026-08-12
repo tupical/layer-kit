@@ -16,6 +16,7 @@
 //! object+event persistence a layer opts into when it must survive a restart.
 
 pub mod ai;
+pub mod test_support;
 pub mod time;
 
 mod error;
