@@ -1,5 +1,4 @@
-//! SQLite persistence shared by every MeiSei layer server: a `kind`-keyed
-//! object table plus the append-only event log of the writes behind it.
+//! SQLite object persistence shared by every MeiSei layer server.
 //!
 //! Deliberately domain-blind — a layer stores its own typed object as JSON
 //! under its own `kind` (`"raw_item"`, `"decision"`, ...) and deserializes on
@@ -19,16 +18,6 @@ use sqlx::Row;
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
-}
-
-/// One row of the append-only write log.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct StoredEvent {
-    pub seq: i64,
-    pub kind: String,
-    pub object_id: String,
-    pub payload: serde_json::Value,
-    pub occurred_at: String,
 }
 
 impl Store {
@@ -61,17 +50,15 @@ impl Store {
         &self.pool
     }
 
-    /// Upsert an object and append the matching event, atomically. Returns the
-    /// event's `seq`. `created_at` survives an overwrite; `updated_at` moves.
+    /// Upsert an object. `created_at` survives an overwrite; `updated_at` moves.
     pub async fn put<T: Serialize>(
         &self,
         kind: &str,
         id: &str,
         object: &T,
-    ) -> Result<i64, sqlx::Error> {
+    ) -> Result<(), sqlx::Error> {
         let payload = serde_json::to_string(object).map_err(encode_err)?;
         let now = crate::time::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO objects (kind, id, payload, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?4)
@@ -81,21 +68,9 @@ impl Store {
         .bind(id)
         .bind(&payload)
         .bind(&now)
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await?;
-        let seq = sqlx::query(
-            "INSERT INTO events (kind, object_id, payload, occurred_at)
-             VALUES (?1, ?2, ?3, ?4) RETURNING seq",
-        )
-        .bind(kind)
-        .bind(id)
-        .bind(&payload)
-        .bind(&now)
-        .fetch_one(&mut *tx)
-        .await?
-        .get::<i64, _>("seq");
-        tx.commit().await?;
-        Ok(seq)
+        Ok(())
     }
 
     /// Fetch one object, `None` when absent.
@@ -131,8 +106,7 @@ impl Store {
         .collect()
     }
 
-    /// Delete an object. The events that produced it are kept — the log is
-    /// append-only. `true` when a row was removed.
+    /// Delete an object. `true` when a row was removed.
     pub async fn delete(&self, kind: &str, id: &str) -> Result<bool, sqlx::Error> {
         let done = sqlx::query("DELETE FROM objects WHERE kind = ?1 AND id = ?2")
             .bind(kind)
@@ -140,34 +114,6 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(done.rows_affected() > 0)
-    }
-
-    /// Events with `seq > after`, oldest first — the cursor a follower (a
-    /// projection, the platform) polls with.
-    pub async fn events_since(
-        &self,
-        after: i64,
-        limit: i64,
-    ) -> Result<Vec<StoredEvent>, sqlx::Error> {
-        sqlx::query(
-            "SELECT seq, kind, object_id, payload, occurred_at FROM events
-             WHERE seq > ?1 ORDER BY seq LIMIT ?2",
-        )
-        .bind(after)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|r| {
-            Ok(StoredEvent {
-                seq: r.get("seq"),
-                kind: r.get("kind"),
-                object_id: r.get("object_id"),
-                payload: serde_json::from_str(r.get("payload")).map_err(decode_err)?,
-                occurred_at: r.get("occurred_at"),
-            })
-        })
-        .collect()
     }
 }
 
@@ -198,15 +144,14 @@ mod tests {
 
     /// The task's acceptance criterion: a standalone layer survives a restart.
     #[tokio::test]
-    async fn objects_and_events_survive_reopen() {
+    async fn objects_survive_reopen() {
         let path = temp_db();
         let first = Store::open(&path).await.unwrap();
         let item = Item {
             id: "raw_1".into(),
             body: "hello".into(),
         };
-        let seq = first.put("raw_item", &item.id, &item).await.unwrap();
-        assert_eq!(seq, 1, "event log starts at 1");
+        first.put("raw_item", &item.id, &item).await.unwrap();
         drop(first);
 
         // Reopen the same file — migrations are idempotent, data is still there.
@@ -215,9 +160,13 @@ mod tests {
             reopened.get::<Item>("raw_item", "raw_1").await.unwrap(),
             Some(item)
         );
-        let events = reopened.events_since(0, 10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].payload["body"], "hello");
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='events'",
+        )
+        .fetch_one(reopened.pool())
+        .await
+        .unwrap();
+        assert_eq!(n, 0, "0002 must drop the events table");
         std::fs::remove_file(&path).ok();
     }
 
@@ -226,25 +175,43 @@ mod tests {
         let path = temp_db();
         let store = Store::open(&path).await.unwrap();
         store
-            .put("raw_item", "a", &Item { id: "a".into(), body: "one".into() })
+            .put(
+                "raw_item",
+                "a",
+                &Item {
+                    id: "a".into(),
+                    body: "one".into(),
+                },
+            )
             .await
             .unwrap();
         store
-            .put("decision", "d", &Item { id: "d".into(), body: "other kind".into() })
+            .put(
+                "decision",
+                "d",
+                &Item {
+                    id: "d".into(),
+                    body: "other kind".into(),
+                },
+            )
             .await
             .unwrap();
-        // Overwrite: one object, but a second event for it.
+        // Overwrite the existing object.
         store
-            .put("raw_item", "a", &Item { id: "a".into(), body: "two".into() })
+            .put(
+                "raw_item",
+                "a",
+                &Item {
+                    id: "a".into(),
+                    body: "two".into(),
+                },
+            )
             .await
             .unwrap();
 
         let raw: Vec<Item> = store.list("raw_item", 10).await.unwrap();
         assert_eq!(raw.len(), 1, "upsert must not duplicate the object");
         assert_eq!(raw[0].body, "two");
-        assert_eq!(store.events_since(0, 10).await.unwrap().len(), 3);
-        assert_eq!(store.events_since(2, 10).await.unwrap()[0].seq, 3);
-
         assert!(store.delete("raw_item", "a").await.unwrap());
         assert!(!store.delete("raw_item", "a").await.unwrap(), "already gone");
         assert!(store.get::<Item>("raw_item", "a").await.unwrap().is_none());

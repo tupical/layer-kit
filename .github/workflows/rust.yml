@@ -6,10 +6,10 @@ name: Rust
 # зелёные тесты были зелены лишь локально и лишь если кто-то прогонит руками.
 on:
   pull_request:
-    paths: ["**/*.rs", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml"]
+    paths: ["**/*.rs", "migrations/**", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml"]
   push:
     branches: [master]
-    paths: ["**/*.rs", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml"]
+    paths: ["**/*.rs", "migrations/**", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml"]
   workflow_dispatch:
 
 jobs:

@@ -37,11 +37,7 @@ fn sign(secret: &[u8], claims_b64: &str) -> HmacSha256 {
     mac
 }
 
-/// Mint a token. The platform owns this; included here so a layer server's
-/// tests (and a future `--mint` admin helper) can exercise the exact
-/// contract.
-// ponytail: used by tests + the planned `--mint` helper, not any bin yet.
-#[allow(dead_code)]
+/// Mint a token using the shared platform→tool contract.
 pub fn mint(secret: &[u8], claims: &Claims) -> String {
     let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).expect("claims serialize"));
     let sig = URL_SAFE_NO_PAD.encode(sign(secret, &claims_b64).finalize().into_bytes());
@@ -81,6 +77,41 @@ mod tests {
         assert_eq!(
             verify(secret, "test-tool", 9_999, &t).unwrap().workspace,
             "ws1"
+        );
+    }
+
+    #[test]
+    fn token_wire_format_is_stable() {
+        let claims = Claims {
+            workspace: "workspace-1".into(),
+            project: Some("project-1".into()),
+            tool: "torii".into(),
+            exp: 1_800_000_000,
+        };
+        let token = mint(b"fixed-secret", &claims);
+        assert_eq!(
+            token,
+            "eyJ3b3Jrc3BhY2UiOiJ3b3Jrc3BhY2UtMSIsInByb2plY3QiOiJwcm9qZWN0LTEiLCJ0b29sIjoidG9yaWkiLCJleHAiOjE4MDAwMDAwMDB9.4ZUc212HFNw78tT7seElX0HgZjorhLVGTGQ_7WlRqA0"
+        );
+        assert_eq!(
+            verify(b"fixed-secret", "torii", 1_700_000_000, &token),
+            Some(claims)
+        );
+
+        let claims = Claims {
+            workspace: "workspace-1".into(),
+            project: None,
+            tool: "torii".into(),
+            exp: 1_800_000_000,
+        };
+        let token = mint(b"fixed-secret", &claims);
+        assert_eq!(
+            token,
+            "eyJ3b3Jrc3BhY2UiOiJ3b3Jrc3BhY2UtMSIsInByb2plY3QiOm51bGwsInRvb2wiOiJ0b3JpaSIsImV4cCI6MTgwMDAwMDAwMH0.ZDQSmjgauWhqrmdu_u7ZL9LIQ9VeDcT-h5TdrZshuAc"
+        );
+        assert_eq!(
+            verify(b"fixed-secret", "torii", 1_700_000_000, &token),
+            Some(claims)
         );
     }
 
