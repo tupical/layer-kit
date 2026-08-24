@@ -8,8 +8,14 @@
 //!                     instead of failing at call time.
 //!   OPENAI_BASE_URL — default `https://api.openai.com/v1`.
 //!   OPENAI_MODEL    — default `gpt-4.1`.
+//!
+//! Transport timeouts and keepalive mirror daruma's ai-infra client so one
+//! wedged upstream provider cannot stall a layer hop forever:
+//!   OPENAI_REQUEST_TIMEOUT_SECONDS — optional cap on a whole request,
+//!                     default [`REQUEST_TIMEOUT`].
 
 use serde_json::{json, Value};
+use std::time::Duration;
 
 pub use crate::ai::AiConfig;
 use crate::ai::{parse_usage, AiError, AiOutput, AiProvider, AiRequest, AiUsage, ToolCall};
@@ -23,12 +29,92 @@ pub struct OpenAiProvider {
     cfg: AiConfig,
 }
 
+/// How long to wait for the TCP+TLS handshake before giving up.
+///
+/// The kernel's own ceiling here is `tcp_syn_retries`, typically two minutes of
+/// silent retrying. Nothing upstream wants to wait that long to learn a provider
+/// is unreachable.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ceiling on a whole request, handshake to last byte.
+///
+/// Well above any legitimate reasoning time for a single tool call, and far
+/// enough below "wait forever" to bound the damage when a provider accepts a
+/// request and never answers. That is not hypothetical: production recorded a
+/// call sitting on a TCP-healthy connection for a full 300 seconds with nothing
+/// coming back, which no transport setting can fix. This is the ceiling that
+/// actually applies now that `tcp_user_timeout` no longer cuts calls off early,
+/// so it doubles as the cap on how long one wedged call can stall an audit pass.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Keepalive probe interval on idle sockets.
+///
+/// A request awaiting a slow model looks exactly like an idle connection to a
+/// NAT or load balancer, which is how such a connection gets dropped mid-answer;
+/// probes keep the flow alive and, if the peer really is gone, surface it as a
+/// prompt error rather than a stalled read.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// Drop pooled connections well before typical middlebox idle limits, so a
+/// request is not handed a socket that has already been discarded upstream.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl OpenAiProvider {
     pub fn new(cfg: AiConfig) -> Self {
-        Self {
-            http: reqwest::Client::new(),
-            cfg,
-        }
+        let timeout = cfg
+            .request_timeout_seconds
+            .map(Duration::from_secs)
+            .unwrap_or(REQUEST_TIMEOUT);
+        let http = Self::http_client_builder()
+            .timeout(timeout)
+            .tcp_user_timeout(timeout)
+            .build()
+            .expect("openai http client build failed");
+        Self::with_http_client(cfg, http)
+    }
+
+    /// Build a provider over a caller-supplied HTTP client.
+    ///
+    /// [`OpenAiProvider::new`] applies the documented transport budget itself;
+    /// this constructor is for callers (tests, hosts with their own TLS or
+    /// proxy policy) that must control the client directly. Whatever timeouts
+    /// the client carries are the ones that apply — the provider adds none.
+    pub fn with_http_client(cfg: AiConfig, http: reqwest::Client) -> Self {
+        Self { http, cfg }
+    }
+
+    /// The transport settings [`OpenAiProvider::new`] applies.
+    ///
+    /// Exposed so callers that must build their own client start from these
+    /// rather than from a bare `reqwest::Client::new()`, which has no timeout,
+    /// no connect timeout and no keepalive whatsoever.
+    pub fn http_client_builder() -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .tcp_keepalive(TCP_KEEPALIVE)
+            // `reqwest` defaults this to 30 seconds, which quietly caps how long
+            // any request may wait: `TCP_USER_TIMEOUT` makes the kernel abort the
+            // connection with `ETIMEDOUT` once data goes unacknowledged that
+            // long, and an unanswered keepalive probe counts. A provider that
+            // stays silent while its model thinks therefore had its connection
+            // killed mid-answer at ~32s — measured in production at 32348,
+            // 32102 and 32263 ms, a spread far too tight for packet loss.
+            //
+            // The ceiling on a slow model belongs to the request timeout, not to
+            // a TCP-level abort a full order of magnitude below it, so this is
+            // aligned with `REQUEST_TIMEOUT`. Keepalive still runs, so a peer
+            // that is genuinely gone is still detected — just not mistaken for
+            // one that is merely thinking.
+            .tcp_user_timeout(REQUEST_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        // Deliberately no `CryptoProvider::install_default()` here. layer-kit
+        // builds reqwest with the `rustls-tls` feature, whose ring provider is
+        // compiled in and selected automatically, so a manual install is
+        // redundant. daruma's ai-infra does install one because it builds with
+        // `rustls-no-provider`; copying that setup here would drag in
+        // tokio-rustls as an extra dependency for nothing. If this crate ever
+        // switches to a no-provider feature set, revisit.
     }
 
     pub fn model(&self) -> &str {
@@ -223,7 +309,88 @@ mod tests {
             model: "gpt-4.1".into(),
             max_output_tokens,
             api_protocol: ApiProtocol::default(),
+            request_timeout_seconds: None,
         }
+    }
+
+    #[test]
+    fn transport_constants_match_the_documented_budget() {
+        // The values are load-bearing (see the doc comments above and the
+        // production incident they encode); lock them so an innocent-looking
+        // bump cannot silently change the failure mode of a wedged provider.
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(TCP_KEEPALIVE, Duration::from_secs(30));
+        assert_eq!(POOL_IDLE_TIMEOUT, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn http_client_builder_builds_a_client() {
+        // The shared builder must stay buildable on its own: callers that
+        // need their own client start from it instead of Client::new().
+        let client = OpenAiProvider::http_client_builder().build();
+        assert!(client.is_ok(), "{client:?}");
+    }
+
+    /// Регрессия на «зависший upstream вешает хоп навечно»: провайдер,
+    /// построенный против TCP-сокета, который принимает соединение и молчит,
+    /// обязан вернуть ошибку в пределах таймаута запроса, а не висеть.
+    #[tokio::test]
+    async fn black_hole_provider_fails_within_request_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Чёрная дыра: accept'им и держим сокет открытым, но не отвечаем.
+        // ВАЖНО: сокет обязан быть именно привязан к переменной и доживать
+        // вместе с задачей — `let _ = socket` роняет его сразу (паттерн `_`
+        // не биндит), клиент получает мгновенный FIN вместо тишины.
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _held_open = socket; // держим, ответа не будет
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        let mut config = cfg(None);
+        config.base_url = format!("http://{addr}/v1");
+        // Тот же механизм, что и OPENAI_REQUEST_TIMEOUT_SECONDS, но с
+        // маленьким значением — тест не должен ждать дефолтные 120 секунд.
+        config.request_timeout_seconds = Some(1);
+        // Клиент собираем вручную с no_proxy(): иначе на машинах с
+        // HTTP_PROXY/HTTPS_PROXY reqwest уходит через системный прокси,
+        // который мгновенно отвечает 502, и вместо таймаута тест получает
+        // быструю ошибку — ассерт «провисел >= 500 мс» падает. no_proxy()
+        // отключает системные прокси, делая чёрную дыру единственным путём.
+        let http = OpenAiProvider::http_client_builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .tcp_user_timeout(Duration::from_secs(1))
+            .build()
+            .expect("test http client build failed");
+        let provider = OpenAiProvider::with_http_client(config, http);
+
+        let started = std::time::Instant::now();
+        let err = provider
+            .respond_with_usage(AiRequest {
+                input: Value::String("ping".into()),
+                tools: vec![],
+                tool_choice: None,
+            })
+            .await
+            .expect_err("black-hole upstream must fail within the timeout, not hang");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed <= Duration::from_secs(5),
+            "call stalled {elapsed:?} past the 1s request timeout: {err}"
+        );
+        // Соединение установлено успешно, значит ошибка пришла именно от
+        // таймаута ожидания ответа, а не от refused-коннекта.
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "failed too early ({elapsed:?}) — not the request timeout: {err}"
+        );
     }
 
     #[test]
@@ -323,3 +490,4 @@ mod tests {
         assert!(parse_chat_outputs(&responses_shape).is_err());
     }
 }
+

@@ -59,6 +59,11 @@ pub struct AiConfig {
     /// Which endpoint/body dialect to speak. Missing on the wire = Responses
     /// (backward compatibility with senders that predate the field).
     pub api_protocol: ApiProtocol,
+    /// Cap on a whole AI request, in seconds. `None` falls back to
+    /// [`crate::openai::REQUEST_TIMEOUT`]. Env override:
+    /// `OPENAI_REQUEST_TIMEOUT_SECONDS` — for slow providers in deploy and
+    /// for tests that must not wait out the default.
+    pub request_timeout_seconds: Option<u64>,
 }
 
 impl AiConfig {
@@ -85,6 +90,13 @@ impl AiConfig {
             max_output_tokens: std::env::var("OPENAI_MAX_OUTPUT_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok()),
+            request_timeout_seconds: std::env::var("OPENAI_REQUEST_TIMEOUT_SECONDS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                // `0` отфильтровываем: reqwest трактует нулевой timeout как
+                // «таймаута нет», то есть молчаливый бесконечный ханг —
+                // ровно противоположное тому, что имел в виду оператор.
+                .filter(|&v| v > 0),
             api_protocol,
         })
     }
@@ -124,6 +136,9 @@ pub fn extract_ai_config(arguments: &mut Value) -> Option<AiConfig> {
             .get("max_output_tokens")
             .and_then(Value::as_u64)
             .and_then(|v| u32::try_from(v).ok()),
+        // Request-scoped configs do not carry a timeout: the transport budget
+        // is a deploy-level concern, set via OPENAI_REQUEST_TIMEOUT_SECONDS.
+        request_timeout_seconds: None,
         api_protocol,
     })
 }
