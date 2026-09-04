@@ -15,10 +15,10 @@ use layer_kit::ai::{extract_ai_config, AiOutput, AiProvider, AiRequest};
 use layer_kit::openai::OpenAiProvider;
 use serde_json::{json, Value};
 
-type Seen = Arc<Mutex<Vec<String>>>;
+type Seen = Arc<Mutex<Vec<(String, Value)>>>;
 
-async fn chat(State(seen): State<Seen>, uri: Uri) -> Json<Value> {
-    seen.lock().unwrap().push(uri.path().to_owned());
+async fn chat(State(seen): State<Seen>, uri: Uri, Json(body): Json<Value>) -> Json<Value> {
+    seen.lock().unwrap().push((uri.path().to_owned(), body));
     Json(json!({
         "choices": [{
             "finish_reason": "tool_calls",
@@ -32,7 +32,9 @@ async fn chat(State(seen): State<Seen>, uri: Uri) -> Json<Value> {
 }
 
 async fn other(State(seen): State<Seen>, uri: Uri) -> (StatusCode, &'static str) {
-    seen.lock().unwrap().push(uri.path().to_owned());
+    seen.lock()
+        .unwrap()
+        .push((uri.path().to_owned(), Value::Null));
     (StatusCode::NOT_FOUND, "only /chat/completions exists here")
 }
 
@@ -68,5 +70,91 @@ async fn chat_completions_protocol_reaches_the_chat_endpoint() {
         .expect("chat-protocol call against a chat-only stub must succeed");
 
     assert!(matches!(&out[0], AiOutput::ToolCall(tc) if tc.name == "report"));
-    assert_eq!(seen.lock().unwrap().as_slice(), ["/v1/chat/completions"]);
+    provider
+        .respond(AiRequest {
+            input: Value::String("ping".into()),
+            tools: vec![json!({
+                "type": "function",
+                "name": "report",
+                "strict": true,
+                "parameters": {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+            })],
+            tool_choice: Some("required".into()),
+        })
+        .await
+        .expect("strict chat tool must keep the chat-compatible wire shape");
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[0].0, "/v1/chat/completions");
+    assert!(seen[0].1["tools"][0]["function"].get("strict").is_none());
+    assert!(seen[0].1["tools"][0]["function"]["parameters"]
+        .get("additionalProperties")
+        .is_none());
+    assert_eq!(seen[1].0, "/v1/chat/completions");
+    let strict_function = &seen[1].1["tools"][0]["function"];
+    assert_eq!(strict_function["strict"], true);
+    assert_eq!(strict_function["parameters"]["additionalProperties"], false);
+    assert_eq!(strict_function["parameters"]["required"], json!(["ok"]));
+}
+
+async fn responses(State(seen): State<Seen>, uri: Uri, Json(body): Json<Value>) -> Json<Value> {
+    seen.lock().unwrap().push((uri.path().to_owned(), body));
+    Json(json!({
+        "status": "completed",
+        "output": [{"type": "function_call", "name": "report", "arguments": "{\"ok\":true}"}]
+    }))
+}
+
+#[tokio::test]
+async fn strict_tool_reaches_responses_with_closed_nested_schema() {
+    let seen: Seen = Seen::default();
+    let app = axum::Router::new()
+        .route("/v1/responses", post(responses))
+        .with_state(seen.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let mut params = json!({"ai": {
+        "api_key": "k",
+        "base_url": format!("http://{addr}/v1"),
+        "model": "m"
+    }});
+    let provider = OpenAiProvider::new(extract_ai_config(&mut params).unwrap());
+    provider
+        .respond(AiRequest {
+            input: Value::String("ping".into()),
+            tools: vec![json!({
+                "type": "function",
+                "name": "report",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "result": {
+                            "type": "object",
+                            "properties": {"ok": {"type": "boolean"}}
+                        }
+                    }
+                }
+            })],
+            tool_choice: Some("required".into()),
+        })
+        .await
+        .unwrap();
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[0].0, "/v1/responses");
+    let tool = &seen[0].1["tools"][0];
+    assert_eq!(tool["strict"], true);
+    assert_eq!(tool["parameters"]["additionalProperties"], false);
+    assert_eq!(tool["parameters"]["required"], json!(["result"]));
+    assert_eq!(
+        tool["parameters"]["properties"]["result"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        tool["parameters"]["properties"]["result"]["required"],
+        json!(["ok"])
+    );
 }

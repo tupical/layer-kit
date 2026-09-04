@@ -18,8 +18,8 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 pub use crate::ai::AiConfig;
-use crate::ai::{parse_usage, AiError, AiOutput, AiProvider, AiRequest, AiUsage, ToolCall};
 use crate::ai::ApiProtocol;
+use crate::ai::{parse_usage, AiError, AiOutput, AiProvider, AiRequest, AiUsage, ToolCall};
 
 /// [`AiProvider`] backed by the OpenAI Responses API. Clone is cheap (the
 /// inner `reqwest::Client` is Arc-backed).
@@ -148,7 +148,7 @@ impl AiProvider for OpenAiProvider {
         let body: Value = resp
             .json()
             .await
-            .map_err(|e| AiError::new(format!("ai response decode failed: {e}")))?;
+            .map_err(|e| AiError::schema(format!("ai response decode failed: {e}")))?;
         let outputs = match self.cfg.api_protocol {
             ApiProtocol::Responses => parse_outputs(&body)?,
             ApiProtocol::ChatCompletions => parse_chat_outputs(&body)?,
@@ -164,7 +164,10 @@ impl AiProvider for OpenAiProvider {
 fn endpoint_and_body(cfg: &AiConfig, req: &AiRequest) -> (String, Value) {
     match cfg.api_protocol {
         ApiProtocol::Responses => (cfg.responses_url(), build_request_body(cfg, req)),
-        ApiProtocol::ChatCompletions => (cfg.chat_completions_url(), build_chat_request_body(cfg, req)),
+        ApiProtocol::ChatCompletions => (
+            cfg.chat_completions_url(),
+            build_chat_request_body(cfg, req),
+        ),
     }
 }
 
@@ -174,6 +177,43 @@ fn endpoint_and_body(cfg: &AiConfig, req: &AiRequest) -> (String, Value) {
 /// reserve) small.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 2000;
 
+/// OpenAI strict tools require every object to reject undeclared keys and to
+/// list every declared property as required. Callers opt in with
+/// `"strict": true`; tools without that flag are left untouched for
+/// OpenAI-compatible providers that do not implement strict schemas.
+fn prepare_tool(tool: &Value) -> Value {
+    let mut tool = tool.clone();
+    if tool.get("strict").and_then(Value::as_bool) == Some(true) {
+        if let Some(schema) = tool.get_mut("parameters") {
+            make_schema_strict(schema);
+        }
+    }
+    tool
+}
+
+fn make_schema_strict(schema: &mut Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+    if obj.get("type").and_then(Value::as_str) == Some("object") {
+        let required = obj
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|properties| properties.keys().cloned().map(Value::String).collect());
+        obj.insert("additionalProperties".into(), Value::Bool(false));
+        if let Some(required) = required {
+            obj.insert("required".into(), Value::Array(required));
+        }
+    }
+    for value in obj.values_mut() {
+        match value {
+            Value::Object(_) => make_schema_strict(value),
+            Value::Array(values) => values.iter_mut().for_each(make_schema_strict),
+            _ => {}
+        }
+    }
+}
+
 /// Build the Responses API request body. Pure — unit-tested without network.
 fn build_request_body(cfg: &AiConfig, req: &AiRequest) -> Value {
     let mut obj = json!({
@@ -182,7 +222,7 @@ fn build_request_body(cfg: &AiConfig, req: &AiRequest) -> Value {
         "max_output_tokens": cfg.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
     });
     if !req.tools.is_empty() {
-        obj["tools"] = Value::Array(req.tools.clone());
+        obj["tools"] = Value::Array(req.tools.iter().map(prepare_tool).collect());
     }
     if let Some(tc) = &req.tool_choice {
         obj["tool_choice"] = Value::String(tc.clone());
@@ -204,8 +244,9 @@ fn build_chat_request_body(cfg: &AiConfig, req: &AiRequest) -> Value {
             req.tools
                 .iter()
                 .map(|tool| {
+                    let tool = prepare_tool(tool);
                     let mut function = serde_json::Map::new();
-                    for field in ["name", "description", "parameters"] {
+                    for field in ["name", "description", "parameters", "strict"] {
                         if let Some(value) = tool.get(field) {
                             function.insert(field.into(), value.clone());
                         }
@@ -226,16 +267,16 @@ fn parse_chat_outputs(body: &Value) -> Result<Vec<AiOutput>, AiError> {
     let choice = body["choices"]
         .as_array()
         .and_then(|choices| choices.first())
-        .ok_or_else(|| AiError::new("response missing 'choices[0]'"))?;
+        .ok_or_else(|| AiError::schema("response missing 'choices[0]'"))?;
     if choice["finish_reason"] == "length" {
-        return Err(AiError::new(
+        return Err(AiError::output_budget(
             "chat completion exhausted its token budget; increase max_output_tokens",
         ));
     }
     let message = choice
         .get("message")
         .and_then(Value::as_object)
-        .ok_or_else(|| AiError::new("response missing 'choices[0].message'"))?;
+        .ok_or_else(|| AiError::schema("response missing 'choices[0].message'"))?;
     let mut out = Vec::new();
     if let Some(content) = message.get("content").and_then(Value::as_str) {
         out.push(AiOutput::Text(content.to_owned()));
@@ -245,12 +286,14 @@ fn parse_chat_outputs(body: &Value) -> Result<Vec<AiOutput>, AiError> {
             let function = &tool_call["function"];
             let name = function["name"]
                 .as_str()
-                .ok_or_else(|| AiError::new("tool call missing function.name"))?;
-            let arguments = function["arguments"]
-                .as_str()
-                .ok_or_else(|| AiError::new("tool call function.arguments must be a JSON string"))?;
+                .ok_or_else(|| AiError::schema("tool call missing function.name"))?;
+            let arguments = function["arguments"].as_str().ok_or_else(|| {
+                AiError::schema("tool call function.arguments must be a JSON string")
+            })?;
             serde_json::from_str::<Value>(arguments).map_err(|error| {
-                AiError::new(format!("invalid tool call function.arguments JSON: {error}"))
+                AiError::schema(format!(
+                    "invalid tool call function.arguments JSON: {error}"
+                ))
             })?;
             out.push(AiOutput::ToolCall(ToolCall {
                 name: name.to_owned(),
@@ -259,7 +302,7 @@ fn parse_chat_outputs(body: &Value) -> Result<Vec<AiOutput>, AiError> {
         }
     }
     if out.is_empty() {
-        return Err(AiError::new(
+        return Err(AiError::schema(
             "chat response has neither content nor tool_calls",
         ));
     }
@@ -269,9 +312,22 @@ fn parse_chat_outputs(body: &Value) -> Result<Vec<AiOutput>, AiError> {
 /// Parse the `output` array of a Responses API reply into lib [`AiOutput`]s.
 /// Pure — unit-tested without network.
 fn parse_outputs(body: &Value) -> Result<Vec<AiOutput>, AiError> {
+    if body["status"] == "incomplete" {
+        let reason = body["incomplete_details"]["reason"]
+            .as_str()
+            .unwrap_or("unknown");
+        let message = format!(
+            "response incomplete ({reason}); increase max_output_tokens or ask for fewer items"
+        );
+        return Err(if reason == "max_output_tokens" {
+            AiError::output_budget(message)
+        } else {
+            AiError::schema(message)
+        });
+    }
     let items = body["output"]
         .as_array()
-        .ok_or_else(|| AiError::new("response missing 'output' array"))?;
+        .ok_or_else(|| AiError::schema("response missing 'output' array"))?;
     let mut out = Vec::new();
     for item in items {
         match item["type"].as_str() {
@@ -287,9 +343,19 @@ fn parse_outputs(body: &Value) -> Result<Vec<AiOutput>, AiError> {
                 }
             }
             Some("function_call") => {
+                let name = item["name"]
+                    .as_str()
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| AiError::schema("function call missing name"))?;
+                let arguments = item["arguments"].as_str().ok_or_else(|| {
+                    AiError::schema("function call arguments must be a JSON string")
+                })?;
+                serde_json::from_str::<Value>(arguments).map_err(|error| {
+                    AiError::schema(format!("invalid function call arguments JSON: {error}"))
+                })?;
                 out.push(AiOutput::ToolCall(ToolCall {
-                    name: item["name"].as_str().unwrap_or("").to_owned(),
-                    arguments: item["arguments"].as_str().unwrap_or("{}").to_owned(),
+                    name: name.to_owned(),
+                    arguments: arguments.to_owned(),
                 }));
             }
             _ => {} // Unknown output type — skip gracefully.
@@ -301,6 +367,7 @@ fn parse_outputs(body: &Value) -> Result<Vec<AiOutput>, AiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::AiErrorKind;
 
     fn cfg(max_output_tokens: Option<u32>) -> AiConfig {
         AiConfig {
@@ -419,6 +486,70 @@ mod tests {
     }
 
     #[test]
+    fn strict_tools_keep_the_flag_and_close_nested_schemas_in_both_protocols() {
+        let req = AiRequest {
+            input: Value::String("p".into()),
+            tools: vec![json!({
+                "type": "function",
+                "name": "report",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "result": {
+                            "type": "object",
+                            "properties": {"ok": {"type": "boolean"}}
+                        }
+                    }
+                }
+            })],
+            tool_choice: Some("required".into()),
+        };
+
+        let responses = build_request_body(&cfg(None), &req);
+        let responses_tool = &responses["tools"][0];
+        assert_eq!(responses_tool["strict"], true);
+        assert_eq!(responses_tool["parameters"]["additionalProperties"], false);
+        assert_eq!(responses_tool["parameters"]["required"], json!(["result"]));
+        assert_eq!(
+            responses_tool["parameters"]["properties"]["result"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            responses_tool["parameters"]["properties"]["result"]["required"],
+            json!(["ok"])
+        );
+
+        let mut chat_cfg = cfg(None);
+        chat_cfg.api_protocol = ApiProtocol::ChatCompletions;
+        let chat = build_chat_request_body(&chat_cfg, &req);
+        let chat_function = &chat["tools"][0]["function"];
+        assert_eq!(chat_function["strict"], responses_tool["strict"]);
+        assert_eq!(chat_function["parameters"], responses_tool["parameters"]);
+    }
+
+    #[test]
+    fn tools_without_strict_opt_in_keep_provider_compatible_schema() {
+        let tool = json!({
+            "type": "function",
+            "name": "report",
+            "parameters": {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+        });
+        let req = AiRequest {
+            input: Value::String("p".into()),
+            tools: vec![tool.clone()],
+            tool_choice: None,
+        };
+
+        assert_eq!(build_request_body(&cfg(None), &req)["tools"][0], tool);
+        let chat = build_chat_request_body(&cfg(None), &req);
+        assert!(chat["tools"][0]["function"].get("strict").is_none());
+        assert!(chat["tools"][0]["function"]["parameters"]
+            .get("additionalProperties")
+            .is_none());
+    }
+
+    #[test]
     fn parse_outputs_message_and_function_call() {
         let body = json!({"output": [
             {"type": "message", "content": [{"type": "output_text", "text": "hi"}]},
@@ -431,7 +562,32 @@ mod tests {
 
     #[test]
     fn parse_outputs_missing_array_is_error() {
-        assert!(parse_outputs(&json!({"id": "resp_1"})).is_err());
+        assert_eq!(
+            parse_outputs(&json!({"id": "resp_1"})).unwrap_err().kind(),
+            AiErrorKind::Schema
+        );
+    }
+
+    #[test]
+    fn parse_outputs_classifies_budget_exhaustion_and_malformed_arguments() {
+        let incomplete = json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type": "function_call", "name": "report", "arguments": "{\"ok\":"}]
+        });
+        assert_eq!(
+            parse_outputs(&incomplete).unwrap_err().kind(),
+            AiErrorKind::OutputBudget
+        );
+
+        let malformed = json!({
+            "status": "completed",
+            "output": [{"type": "function_call", "name": "report", "arguments": "{\"ok\":"}]
+        });
+        assert_eq!(
+            parse_outputs(&malformed).unwrap_err().kind(),
+            AiErrorKind::Schema
+        );
     }
 
     #[test]
@@ -481,13 +637,18 @@ mod tests {
     #[test]
     fn parse_chat_rejects_length_empty_and_responses_shape() {
         let length = json!({"choices": [{"finish_reason": "length", "message": {"content": ""}}]});
-        assert!(parse_chat_outputs(&length).is_err());
+        assert_eq!(
+            parse_chat_outputs(&length).unwrap_err().kind(),
+            AiErrorKind::OutputBudget
+        );
         let empty = json!({"choices": [{"finish_reason": "stop", "message": {}}]});
-        assert!(parse_chat_outputs(&empty).is_err());
+        assert_eq!(
+            parse_chat_outputs(&empty).unwrap_err().kind(),
+            AiErrorKind::Schema
+        );
         // Тело Responses API парсером chat не принимается — кросс-протокольный
         // ответ должен падать, а не тихо давать пустой результат.
         let responses_shape = json!({"output": []});
         assert!(parse_chat_outputs(&responses_shape).is_err());
     }
 }
-
