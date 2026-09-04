@@ -18,8 +18,8 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 pub use crate::ai::AiConfig;
-use crate::ai::{parse_usage, AiError, AiOutput, AiProvider, AiRequest, AiUsage, ToolCall};
 use crate::ai::ApiProtocol;
+use crate::ai::{parse_usage, AiError, AiOutput, AiProvider, AiRequest, AiUsage, ToolCall};
 
 /// [`AiProvider`] backed by the OpenAI Responses API. Clone is cheap (the
 /// inner `reqwest::Client` is Arc-backed).
@@ -164,7 +164,10 @@ impl AiProvider for OpenAiProvider {
 fn endpoint_and_body(cfg: &AiConfig, req: &AiRequest) -> (String, Value) {
     match cfg.api_protocol {
         ApiProtocol::Responses => (cfg.responses_url(), build_request_body(cfg, req)),
-        ApiProtocol::ChatCompletions => (cfg.chat_completions_url(), build_chat_request_body(cfg, req)),
+        ApiProtocol::ChatCompletions => (
+            cfg.chat_completions_url(),
+            build_chat_request_body(cfg, req),
+        ),
     }
 }
 
