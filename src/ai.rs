@@ -202,6 +202,14 @@ pub(crate) fn parse_usage(body: &Value) -> Option<AiUsage> {
     })
 }
 
+/// Stable class for failures callers may handle without matching messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiErrorKind {
+    Other,
+    OutputBudget,
+    Schema,
+}
+
 /// Error raised by an [`AiProvider`].
 #[derive(Debug, Clone)]
 pub struct AiError(pub String);
@@ -209,6 +217,24 @@ pub struct AiError(pub String);
 impl AiError {
     pub fn new(msg: impl Into<String>) -> Self {
         Self(msg.into())
+    }
+
+    pub fn output_budget(msg: impl Into<String>) -> Self {
+        Self(format!("output_budget: {}", msg.into()))
+    }
+
+    pub fn schema(msg: impl Into<String>) -> Self {
+        Self(format!("schema: {}", msg.into()))
+    }
+
+    pub fn kind(&self) -> AiErrorKind {
+        if self.0.starts_with("output_budget: ") {
+            AiErrorKind::OutputBudget
+        } else if self.0.starts_with("schema: ") {
+            AiErrorKind::Schema
+        } else {
+            AiErrorKind::Other
+        }
     }
 }
 
