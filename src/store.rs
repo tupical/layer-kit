@@ -6,6 +6,12 @@
 //! layers; a layer that outgrows it can still open [`Store::pool`] and run
 //! its own SQL.
 //!
+//! Every read and write is confined to one workspace (and, when the caller
+//! has one, one project): a layer server is shared by all tenants, so a
+//! handler must work through [`Store::scoped`] with the verified token
+//! claims. The bare store is the unscoped namespace `''` — tests and rows
+//! that predate scoping; no platform token reaches it.
+//!
 //! Env: `{TOOL}_DB` (see [`Store::from_env`]) — the file survives restarts,
 //! which is the whole point of this module.
 
@@ -18,6 +24,8 @@ use sqlx::Row;
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
+    workspace: String,
+    project: Option<String>,
 }
 
 impl Store {
@@ -35,7 +43,11 @@ impl Store {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            workspace: String::new(),
+            project: None,
+        })
     }
 
     /// Open the path in `{TOOL}_DB`, defaulting to `./{tool}.db`.
@@ -43,6 +55,18 @@ impl Store {
         let path = std::env::var(format!("{}_DB", tool.to_uppercase()))
             .unwrap_or_else(|_| format!("{tool}.db"));
         Self::open(&path).await
+    }
+
+    /// The same store confined to one tenant: pass the verified token's
+    /// `workspace` / `project`. Objects are keyed by workspace; a
+    /// project-scoped caller also sees workspace-wide objects (no project),
+    /// but not other projects'.
+    pub fn scoped(&self, workspace: &str, project: Option<&str>) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            workspace: workspace.to_owned(),
+            project: project.map(str::to_owned),
+        }
     }
 
     /// Escape hatch for a layer whose queries outgrow this module.
@@ -60,14 +84,16 @@ impl Store {
         let payload = serde_json::to_string(object).map_err(encode_err)?;
         let now = crate::time::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO objects (kind, id, payload, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?4)
-             ON CONFLICT (kind, id) DO UPDATE SET payload = ?3, updated_at = ?4",
+            "INSERT INTO objects (kind, id, payload, created_at, updated_at, workspace, project)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6)
+             ON CONFLICT (workspace, kind, id) DO UPDATE SET payload = ?3, updated_at = ?4",
         )
         .bind(kind)
         .bind(id)
         .bind(&payload)
         .bind(&now)
+        .bind(&self.workspace)
+        .bind(&self.project)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -79,11 +105,15 @@ impl Store {
         kind: &str,
         id: &str,
     ) -> Result<Option<T>, sqlx::Error> {
-        let row = sqlx::query("SELECT payload FROM objects WHERE kind = ?1 AND id = ?2")
-            .bind(kind)
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(&format!(
+            "SELECT payload FROM objects WHERE kind = ?1 AND id = ?2 AND {SCOPE}"
+        ))
+        .bind(kind)
+        .bind(id)
+        .bind(&self.workspace)
+        .bind(&self.project)
+        .fetch_optional(&self.pool)
+        .await?;
         row.map(|r| serde_json::from_str(r.get("payload")).map_err(decode_err))
             .transpose()
     }
@@ -94,11 +124,14 @@ impl Store {
         kind: &str,
         limit: i64,
     ) -> Result<Vec<T>, sqlx::Error> {
-        sqlx::query(
-            "SELECT payload FROM objects WHERE kind = ?1 ORDER BY updated_at DESC, id DESC LIMIT ?2",
-        )
+        sqlx::query(&format!(
+            "SELECT payload FROM objects WHERE kind = ?1 AND {SCOPE}
+             ORDER BY updated_at DESC, id DESC LIMIT ?2"
+        ))
         .bind(kind)
         .bind(limit)
+        .bind(&self.workspace)
+        .bind(&self.project)
         .fetch_all(&self.pool)
         .await?
         .into_iter()
@@ -108,14 +141,22 @@ impl Store {
 
     /// Delete an object. `true` when a row was removed.
     pub async fn delete(&self, kind: &str, id: &str) -> Result<bool, sqlx::Error> {
-        let done = sqlx::query("DELETE FROM objects WHERE kind = ?1 AND id = ?2")
-            .bind(kind)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let done = sqlx::query(&format!(
+            "DELETE FROM objects WHERE kind = ?1 AND id = ?2 AND {SCOPE}"
+        ))
+        .bind(kind)
+        .bind(id)
+        .bind(&self.workspace)
+        .bind(&self.project)
+        .execute(&self.pool)
+        .await?;
         Ok(done.rows_affected() > 0)
     }
 }
+
+/// Tenant filter shared by every read/delete; binds `?3` = workspace,
+/// `?4` = project.
+const SCOPE: &str = "workspace = ?3 AND (?4 IS NULL OR project IS NULL OR project = ?4)";
 
 fn encode_err(e: serde_json::Error) -> sqlx::Error {
     sqlx::Error::Encode(Box::new(e))
@@ -219,6 +260,58 @@ mod tests {
             store.list::<Item>("decision", 10).await.unwrap().len(),
             1,
             "delete must not cross kinds"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// daruma 01a0d3bc: one SQLite serves every tenant — a workspace sees only
+    /// its own objects, a project only its own plus workspace-wide ones, and a
+    /// colliding (kind, id) from another tenant never overwrites.
+    #[tokio::test]
+    async fn scoped_store_isolates_workspaces_and_projects() {
+        let path = temp_db();
+        let store = Store::open(&path).await.unwrap();
+        let item = |body: &str| Item {
+            id: "x".into(),
+            body: body.into(),
+        };
+        let a = store.scoped("ws_a", None);
+        let a_p1 = store.scoped("ws_a", Some("p1"));
+        let a_p2 = store.scoped("ws_a", Some("p2"));
+        let b = store.scoped("ws_b", None);
+        a.put("raw_item", "x", &item("a")).await.unwrap();
+        b.put("raw_item", "x", &item("b")).await.unwrap();
+        a_p1.put("raw_item", "y", &item("a-p1")).await.unwrap();
+        store.put("raw_item", "z", &item("legacy")).await.unwrap();
+
+        let bodies = |v: Vec<Item>| v.into_iter().map(|i| i.body).collect::<Vec<_>>();
+        assert_eq!(bodies(b.list("raw_item", 10).await.unwrap()), ["b"]);
+        assert_eq!(
+            bodies(a.list("raw_item", 10).await.unwrap()),
+            ["a-p1", "a"],
+            "workspace-wide caller sees every project of its workspace"
+        );
+        assert_eq!(
+            bodies(a_p2.list("raw_item", 10).await.unwrap()),
+            ["a"],
+            "another project's object is hidden"
+        );
+        assert_eq!(
+            b.get::<Item>("raw_item", "x").await.unwrap(),
+            Some(item("b"))
+        );
+        assert!(b.get::<Item>("raw_item", "y").await.unwrap().is_none());
+        assert!(
+            !b.delete("raw_item", "y").await.unwrap(),
+            "cannot delete across tenants"
+        );
+        assert_eq!(
+            a.get::<Item>("raw_item", "x").await.unwrap(),
+            Some(item("a"))
+        );
+        assert!(
+            a.get::<Item>("raw_item", "z").await.unwrap().is_none(),
+            "unscoped (legacy) rows are unreachable with a workspace"
         );
         std::fs::remove_file(&path).ok();
     }
