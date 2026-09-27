@@ -44,14 +44,16 @@ pub fn mint(secret: &[u8], claims: &Claims) -> String {
     format!("{claims_b64}.{sig}")
 }
 
-/// Validate signature, expiry, and audience (`tool`). `now` is unix-seconds.
+/// Validate signature, expiry, audience (`tool`) and a non-empty workspace —
+/// `''` is the store's unscoped namespace (see `store::Store::scoped`), which
+/// no token may reach. `now` is unix-seconds.
 /// Signature comparison is constant-time via `hmac::Mac::verify_slice`.
 pub fn verify(secret: &[u8], expected_tool: &str, now: i64, token: &str) -> Option<Claims> {
     let (claims_b64, sig_b64) = token.split_once('.')?;
     let sig = URL_SAFE_NO_PAD.decode(sig_b64).ok()?;
     sign(secret, claims_b64).verify_slice(&sig).ok()?;
     let claims: Claims = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(claims_b64).ok()?).ok()?;
-    if claims.exp < now || claims.tool != expected_tool {
+    if claims.exp < now || claims.tool != expected_tool || claims.workspace.is_empty() {
         return None;
     }
     Some(claims)
@@ -131,6 +133,12 @@ mod tests {
         assert!(
             verify(secret, "test-tool", 1, "garbage").is_none(),
             "malformed"
+        );
+        let mut no_ws = claims("test-tool", 10_000);
+        no_ws.workspace.clear();
+        assert!(
+            verify(secret, "test-tool", 1, &mint(secret, &no_ws)).is_none(),
+            "empty workspace would reach the unscoped store namespace"
         );
     }
 }

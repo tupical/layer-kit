@@ -60,7 +60,9 @@ impl Store {
     /// The same store confined to one tenant: pass the verified token's
     /// `workspace` / `project`. Objects are keyed by workspace; a
     /// project-scoped caller also sees workspace-wide objects (no project),
-    /// but not other projects'.
+    /// but not other projects'. On write the project is provenance, not
+    /// isolation: the key is (workspace, kind, id), so within one workspace a
+    /// caller of another project upserting the same id overwrites the payload.
     pub fn scoped(&self, workspace: &str, project: Option<&str>) -> Self {
         Self {
             pool: self.pool.clone(),
