@@ -15,4 +15,7 @@ Function tools opt in with `"strict": true`. Layer Kit preserves that flag for
 both Responses and Chat Completions and closes every object schema recursively.
 Tools without the flag are sent unchanged for compatibility with providers
 that do not implement OpenAI strict schemas. Token-budget exhaustion and
-invalid response schemas are distinguished by `AiError::kind()`.
+invalid response schemas are distinguished by `AiError::kind()`, an explicit
+field set by the constructor — never parsed from the message. Wrap with
+`AiError::context()` to keep the kind; a body that fails to decode is a
+transport fault (`Other`), not a schema error.
