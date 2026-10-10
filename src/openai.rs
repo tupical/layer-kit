@@ -148,7 +148,11 @@ impl AiProvider for OpenAiProvider {
         let body: Value = resp
             .json()
             .await
-            .map_err(|e| AiError::schema(format!("ai response decode failed: {e}")))?;
+            // A body that fails to read or decode is a transport fault (cut
+            // connection, proxy HTML page), not a schema the model violated:
+            // classing it Schema sent fujin into a repair retry on a network
+            // error.
+            .map_err(|e| AiError::new(format!("ai response decode failed: {e}")))?;
         let outputs = match self.cfg.api_protocol {
             ApiProtocol::Responses => parse_outputs(&body)?,
             ApiProtocol::ChatCompletions => parse_chat_outputs(&body)?,
@@ -457,6 +461,54 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(500),
             "failed too early ({elapsed:?}) — not the request timeout: {err}"
+        );
+    }
+
+    /// L-11: a 200 whose body is not JSON (a proxy's HTML page, a cut
+    /// connection) is a transport fault. It must be `Other`, not `Schema`,
+    /// or fujin's schema repair retries a network error.
+    #[tokio::test]
+    async fn undecodable_body_is_other_not_schema() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = socket.read(&mut buf).await;
+                    let body = "<html>bad gateway</html>";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let mut config = cfg(None);
+        config.base_url = format!("http://{addr}/v1");
+        // no_proxy(): the dev host's HTTP_PROXY would otherwise answer for
+        // the loopback stub (see black_hole_provider_fails_within_request_timeout).
+        let http = OpenAiProvider::http_client_builder()
+            .no_proxy()
+            .build()
+            .expect("test http client build failed");
+        let provider = OpenAiProvider::with_http_client(config, http);
+
+        let err = provider
+            .respond_with_usage(AiRequest {
+                input: Value::String("ping".into()),
+                tools: vec![],
+                tool_choice: None,
+            })
+            .await
+            .expect_err("non-JSON body must fail");
+        assert_eq!(err.kind(), AiErrorKind::Other, "{err}");
+        assert!(
+            err.to_string().starts_with("ai response decode failed"),
+            "{err}"
         );
     }
 

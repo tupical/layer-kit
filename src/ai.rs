@@ -211,36 +211,64 @@ pub enum AiErrorKind {
 }
 
 /// Error raised by an [`AiProvider`].
+///
+/// The class is an explicit field, never parsed back out of the text: a
+/// wrapped or re-worded message keeps its kind, and a message that merely
+/// starts with `schema: ` does not become a schema failure.
 #[derive(Debug, Clone)]
-pub struct AiError(pub String);
+pub struct AiError {
+    kind: AiErrorKind,
+    msg: String,
+}
 
 impl AiError {
     pub fn new(msg: impl Into<String>) -> Self {
-        Self(msg.into())
+        Self::with_kind(AiErrorKind::Other, msg)
     }
 
     pub fn output_budget(msg: impl Into<String>) -> Self {
-        Self(format!("output_budget: {}", msg.into()))
+        Self::with_kind(AiErrorKind::OutputBudget, msg)
     }
 
     pub fn schema(msg: impl Into<String>) -> Self {
-        Self(format!("schema: {}", msg.into()))
+        Self::with_kind(AiErrorKind::Schema, msg)
+    }
+
+    pub fn with_kind(kind: AiErrorKind, msg: impl Into<String>) -> Self {
+        Self {
+            kind,
+            msg: msg.into(),
+        }
     }
 
     pub fn kind(&self) -> AiErrorKind {
-        if self.0.starts_with("output_budget: ") {
-            AiErrorKind::OutputBudget
-        } else if self.0.starts_with("schema: ") {
-            AiErrorKind::Schema
-        } else {
-            AiErrorKind::Other
+        self.kind
+    }
+
+    /// The message without the class prefix [`Display`](fmt::Display) adds.
+    pub fn message(&self) -> &str {
+        &self.msg
+    }
+
+    /// Prepend context to the message; the kind is preserved, so callers
+    /// wrap with this instead of `AiError::new(format!("…: {e}"))`.
+    pub fn context(self, ctx: impl fmt::Display) -> Self {
+        Self {
+            kind: self.kind,
+            msg: format!("{ctx}: {}", self.msg),
         }
     }
 }
 
 impl fmt::Display for AiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        // The prefix is presentation only (logs, fujin's repair prompt read
+        // the same text as before); `kind()` never looks at it.
+        match self.kind {
+            AiErrorKind::Other => write!(f, "{}", self.msg),
+            AiErrorKind::OutputBudget => write!(f, "output_budget: {}", self.msg),
+            AiErrorKind::Schema => write!(f, "schema: {}", self.msg),
+        }
     }
 }
 
@@ -345,6 +373,39 @@ mod tests {
         };
         let (_, usage) = ready(MinimalProvider.respond_with_usage(request)).unwrap();
         assert_eq!(usage, None);
+    }
+
+    #[test]
+    fn error_kind_is_a_field_not_a_text_prefix() {
+        // Wrapping through `context` keeps the class.
+        let wrapped = AiError::schema("x").context("pack");
+        assert_eq!(wrapped.kind(), AiErrorKind::Schema);
+        assert_eq!(wrapped.message(), "pack: x");
+        assert_eq!(wrapped.to_string(), "schema: pack: x");
+        assert_eq!(
+            AiError::output_budget("cut").context("plan").kind(),
+            AiErrorKind::OutputBudget
+        );
+
+        // Text that only looks like a class is not one: a stray prefix no
+        // longer reclassifies a transport or wrapped message.
+        assert_eq!(AiError::new("schema: lookalike").kind(), AiErrorKind::Other);
+        assert_eq!(
+            AiError::new(format!("wrapped: {}", AiError::schema("x"))).kind(),
+            AiErrorKind::Other
+        );
+    }
+
+    #[test]
+    fn error_display_keeps_the_class_prefix() {
+        // Logs and fujin's repair prompt read this text; it must not change.
+        assert_eq!(AiError::schema("bad").to_string(), "schema: bad");
+        assert_eq!(
+            AiError::output_budget("cut").to_string(),
+            "output_budget: cut"
+        );
+        assert_eq!(AiError::new("plain").to_string(), "plain");
+        assert_eq!(AiError::schema("bad").message(), "bad");
     }
 
     #[test]
