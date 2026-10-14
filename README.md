@@ -19,3 +19,17 @@ invalid response schemas are distinguished by `AiError::kind()`, an explicit
 field set by the constructor — never parsed from the message. Wrap with
 `AiError::context()` to keep the kind; a body that fails to decode is a
 transport fault (`Other`), not a schema error.
+
+## AI protocols
+
+`AiConfig.api_protocol` (wire value of `ai.api_protocol` or env
+`OPENAI_API_PROTOCOL`) selects the provider dialect: `responses` (default),
+`chat_completions` or `anthropic_messages`. An unknown value rejects the AI
+config instead of falling back. `anthropic_messages` posts to
+`{base}/v1/messages` (base is the bare host, default
+`https://api.anthropic.com`; a trailing `/v1` is tolerated) with `x-api-key`
+and `anthropic-version: 2023-06-01` instead of Bearer, always sends
+`max_tokens`, and lifts `system` messages of an array input into the
+top-level `system` field. `text` and `tool_use` blocks become outputs; a
+`stop_reason` of `max_tokens` is an `OutputBudget` error. Prompt caching and
+message batches are not supported here.
