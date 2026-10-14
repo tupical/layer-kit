@@ -39,3 +39,7 @@ storage = ["dep:sqlx", "dep:tokio"]
 [[test]]
 name = "chat_protocol"
 required-features = ["server"]
+
+[[test]]
+name = "anthropic_protocol"
+required-features = ["server"]

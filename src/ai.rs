@@ -21,6 +21,9 @@ pub enum ApiProtocol {
     /// OpenAI Chat Completions (`POST {base}/chat/completions`) — what most
     /// OpenAI-compatible proxies actually implement.
     ChatCompletions,
+    /// Anthropic Messages API (`POST {base}/v1/messages`, `base` is the bare
+    /// host). Auth is `x-api-key` + `anthropic-version`, not Bearer.
+    AnthropicMessages,
 }
 
 impl ApiProtocol {
@@ -31,6 +34,7 @@ impl ApiProtocol {
         match value {
             "responses" => Some(Self::Responses),
             "chat_completions" => Some(Self::ChatCompletions),
+            "anthropic_messages" => Some(Self::AnthropicMessages),
             _ => None,
         }
     }
@@ -82,10 +86,18 @@ impl AiConfig {
             },
             _ => ApiProtocol::default(),
         };
+        // The default host follows the protocol: an Anthropic key sent to
+        // api.openai.com fails with a confusing 401 instead of working.
+        let default_base_url = match api_protocol {
+            ApiProtocol::AnthropicMessages => "https://api.anthropic.com",
+            ApiProtocol::Responses | ApiProtocol::ChatCompletions => "https://api.openai.com/v1",
+        };
         Some(Self {
             api_key,
             base_url: std::env::var("OPENAI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| default_base_url.into()),
             model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1".into()),
             max_output_tokens: std::env::var("OPENAI_MAX_OUTPUT_TOKENS")
                 .ok()
@@ -109,6 +121,17 @@ impl AiConfig {
     #[cfg(feature = "server")]
     pub(crate) fn chat_completions_url(&self) -> String {
         format!("{}/chat/completions", self.base_url)
+    }
+
+    /// Anthropic's base is the bare host and the version lives in the path,
+    /// unlike OpenAI-style bases that already end in `/v1`. Both spellings
+    /// are accepted so a base copied either way does not become
+    /// `/v1/v1/messages` (same rule as daruma ai-infra).
+    #[cfg(feature = "server")]
+    pub(crate) fn anthropic_messages_url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        let base = base.strip_suffix("/v1").unwrap_or(base);
+        format!("{base}/v1/messages")
     }
 }
 
@@ -483,12 +506,60 @@ mod tests {
         let cfg = extract_ai_config(&mut arguments).unwrap();
         assert_eq!(cfg.api_protocol, ApiProtocol::ChatCompletions);
 
+        let mut arguments = serde_json::json!({
+            "ai": {"api_key": "k", "base_url": "https://api.anthropic.com", "model": "m",
+                   "api_protocol": "anthropic_messages"}
+        });
+        let cfg = extract_ai_config(&mut arguments).unwrap();
+        assert_eq!(cfg.api_protocol, ApiProtocol::AnthropicMessages);
+
         // Неизвестный протокол — не молчаливый фоллбэк, а отказ от конфига.
         let mut arguments = serde_json::json!({
             "ai": {"api_key": "k", "base_url": "https://ai.test/v1", "model": "m",
                    "api_protocol": "grpc"}
         });
         assert!(extract_ai_config(&mut arguments).is_none());
+    }
+
+    #[test]
+    fn api_protocol_parses_every_wire_value() {
+        assert_eq!(
+            ApiProtocol::parse("responses"),
+            Some(ApiProtocol::Responses)
+        );
+        assert_eq!(
+            ApiProtocol::parse("chat_completions"),
+            Some(ApiProtocol::ChatCompletions)
+        );
+        assert_eq!(
+            ApiProtocol::parse("anthropic_messages"),
+            Some(ApiProtocol::AnthropicMessages)
+        );
+        assert_eq!(ApiProtocol::parse("anthropic"), None);
+    }
+
+    /// The only test touching the process env: no other test here reads
+    /// OPENAI_*, so setting them cannot race a parallel test.
+    #[test]
+    fn from_env_accepts_anthropic_messages_and_defaults_its_host() {
+        std::env::set_var("OPENAI_API_KEY", "sk-ant-test");
+        std::env::set_var("OPENAI_API_PROTOCOL", "anthropic_messages");
+        std::env::remove_var("OPENAI_BASE_URL");
+        let cfg = AiConfig::from_env().expect("anthropic_messages is a known protocol");
+        assert_eq!(cfg.api_protocol, ApiProtocol::AnthropicMessages);
+        assert_eq!(cfg.base_url, "https://api.anthropic.com");
+
+        std::env::set_var("OPENAI_API_PROTOCOL", "grpc");
+        assert!(
+            AiConfig::from_env().is_none(),
+            "unknown protocol is rejected"
+        );
+
+        std::env::remove_var("OPENAI_API_PROTOCOL");
+        let cfg = AiConfig::from_env().unwrap();
+        assert_eq!(cfg.api_protocol, ApiProtocol::Responses);
+        assert_eq!(cfg.base_url, "https://api.openai.com/v1");
+        std::env::remove_var("OPENAI_API_KEY");
     }
 
     #[test]
