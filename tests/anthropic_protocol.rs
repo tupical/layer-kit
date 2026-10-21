@@ -148,3 +148,106 @@ async fn anthropic_messages_protocol_reaches_the_messages_endpoint() {
     assert_eq!(seen.body["tool_choice"], json!({"type": "any"}));
     assert_eq!(log[1].path, "/v1/messages");
 }
+
+/// Ответ-ошибка Anthropic: `{"type":"error","error":{...}}` с HTTP 401/529.
+async fn failing_messages(
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let (status, kind, message) = if headers["x-api-key"] == "sk-ant-revoked" {
+        (
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "invalid x-api-key",
+        )
+    } else {
+        assert_eq!(body["messages"][0]["content"], "overload");
+        (
+            StatusCode::from_u16(529).unwrap(),
+            "overloaded_error",
+            "Overloaded",
+        )
+    };
+    (
+        status,
+        Json(json!({"type": "error", "error": {"type": kind, "message": message}})),
+    )
+}
+
+fn anthropic_provider(addr: std::net::SocketAddr, key: &str) -> OpenAiProvider {
+    let mut params = json!({"ai": {
+        "api_key": key,
+        "base_url": format!("http://{addr}"),
+        "model": "claude-test",
+        "api_protocol": "anthropic_messages"
+    }});
+    let cfg = extract_ai_config(&mut params).expect("anthropic_messages is a valid ai config");
+    let http = OpenAiProvider::http_client_builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+    OpenAiProvider::with_http_client(cfg, http)
+}
+
+/// Ошибка провайдера — транспортная (`Other`), а не `Schema`: иначе fujin
+/// уходит в repair-ретрай модели на отозванном ключе или перегрузке. Статус и
+/// тип ошибки Anthropic видны оператору, ключ в текст ошибки не попадает.
+#[tokio::test]
+async fn anthropic_error_replies_surface_as_transport_errors_without_the_key() {
+    let app = axum::Router::new().route("/v1/messages", post(failing_messages));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let request = |input: &str| AiRequest {
+        input: Value::String(input.into()),
+        tools: vec![],
+        tool_choice: None,
+    };
+
+    let err = anthropic_provider(addr, "sk-ant-revoked")
+        .respond(request("ping"))
+        .await
+        .expect_err("401 must fail");
+    assert_eq!(err.kind(), AiErrorKind::Other, "{err}");
+    let text = err.to_string();
+    assert!(text.contains("status 401"), "{text}");
+    assert!(text.contains("authentication_error"), "{text}");
+    assert!(!text.contains("sk-ant-revoked"), "key leaked: {text}");
+
+    let err = anthropic_provider(addr, "sk-ant-live")
+        .respond(request("overload"))
+        .await
+        .expect_err("529 must fail");
+    assert_eq!(err.kind(), AiErrorKind::Other, "{err}");
+    let text = err.to_string();
+    assert!(text.contains("status 529"), "{text}");
+    assert!(text.contains("overloaded_error"), "{text}");
+    assert!(!text.contains("sk-ant-live"), "key leaked: {text}");
+}
+
+/// Режим без провайдера: нет `ai`-блока, неполный или с неизвестным
+/// протоколом блок — конфига нет (слой уходит в детерминированный путь), а
+/// секрет всё равно вырезан из аргументов до доменной обработки.
+#[test]
+fn without_a_usable_anthropic_block_there_is_no_provider_and_no_secret_left() {
+    let mut absent = json!({"body": "material"});
+    assert!(extract_ai_config(&mut absent).is_none());
+    assert_eq!(absent, json!({"body": "material"}));
+
+    for ai in [
+        // Опечатка в протоколе — отказ, не тихий откат на Responses.
+        json!({"api_key": "sk-ant-k", "base_url": "https://api.anthropic.com",
+               "model": "claude-test", "api_protocol": "anthropic"}),
+        // Нет ключа.
+        json!({"base_url": "https://api.anthropic.com", "model": "claude-test",
+               "api_protocol": "anthropic_messages"}),
+        // Нет модели.
+        json!({"api_key": "sk-ant-k", "base_url": "https://api.anthropic.com",
+               "api_protocol": "anthropic_messages"}),
+    ] {
+        let mut params = json!({"body": "material", "ai": ai.clone()});
+        assert!(extract_ai_config(&mut params).is_none(), "{ai}");
+        assert_eq!(params, json!({"body": "material"}), "secret left in {ai}");
+    }
+}
