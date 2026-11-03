@@ -9,6 +9,34 @@ Dropping the table does not shrink the database file. After the restart, run
 `VACUUM` manually on each database if reclaiming disk space is desired; it is
 intentionally not part of the transactional sqlx migration.
 
+### Migration 0003: old rows land in the unscoped workspace
+
+Migration 0003 confines every object to a tenant: the key becomes
+`(workspace, kind, id)` and each row records the workspace/project of the
+platform token that wrote it. Rows written before 0003 have no known owner, so
+the migration moves them to workspace `''` — the unscoped namespace. No
+platform token reaches it (`auth::verify` rejects an empty workspace), so after
+the restart those objects look missing to every caller. Nothing is deleted;
+the rows are still in the file.
+
+To keep them, hand them to their owner once 0003 has run (`sqlite3
+"$ENMA_DB"`, and so on for every `{TOOL}_DB`; back up first). The value is
+the bare workspace UUID that the platform puts in the token's `workspace`
+claim:
+
+```sql
+UPDATE OR IGNORE objects SET workspace = '<workspace-uuid>' WHERE workspace = '';
+SELECT kind, id FROM objects WHERE workspace = '';
+```
+
+Adopted rows keep an empty `project`, so they become workspace-wide objects
+visible to every project of that workspace. `OR IGNORE` skips a row whose
+`(kind, id)` the workspace has already written since the upgrade: tenant data
+is never overwritten, and the `SELECT` lists what stayed unscoped. This works
+only if the database served one workspace before 0003. A database shared by
+several workspaces kept no record of whose row was whose — assign those by
+`kind`/`id` from your own records, or leave them unscoped.
+
 ## Strict structured output
 
 Function tools opt in with `"strict": true`. Layer Kit preserves that flag for

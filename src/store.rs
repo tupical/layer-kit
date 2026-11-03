@@ -10,7 +10,8 @@
 //! has one, one project): a layer server is shared by all tenants, so a
 //! handler must work through [`Store::scoped`] with the verified token
 //! claims. The bare store is the unscoped namespace `''` — tests and rows
-//! that predate scoping; no platform token reaches it.
+//! that predate scoping; no platform token reaches it. README «Migration
+//! 0003» gives operators the SQL to hand such rows to their workspace.
 //!
 //! Env: `{TOOL}_DB` (see [`Store::from_env`]) — the file survives restarts,
 //! which is the whole point of this module.
@@ -314,6 +315,129 @@ mod tests {
         assert!(
             a.get::<Item>("raw_item", "z").await.unwrap().is_none(),
             "unscoped (legacy) rows are unreachable with a workspace"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// daruma 01a1441c: the README upgrade step for 0003, run verbatim on a
+    /// database that was really written before 0003. Without it legacy rows
+    /// are unreachable; with it they belong to the workspace and a row the
+    /// tenant wrote after the upgrade is not overwritten.
+    #[tokio::test]
+    async fn readme_backfill_hands_pre_0003_rows_to_their_workspace() {
+        const ADOPT: &str =
+            "UPDATE OR IGNORE objects SET workspace = '<workspace-uuid>' WHERE workspace = '';";
+        const LEFT: &str = "SELECT kind, id FROM objects WHERE workspace = '';";
+        let readme = include_str!("../README.md");
+        assert!(
+            readme.contains(ADOPT) && readme.contains(LEFT),
+            "README must carry exactly the backfill this test runs"
+        );
+
+        // A database at 0002, built from the shipped migration files.
+        let path = temp_db();
+        let old = std::env::temp_dir().join(format!("layer-kit-0002-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&old).unwrap();
+        for f in ["0001_initial.sql", "0002_drop_events.sql"] {
+            std::fs::copy(
+                format!("{}/migrations/{f}", env!("CARGO_MANIFEST_DIR")),
+                old.join(f),
+            )
+            .unwrap();
+        }
+        let pool = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        sqlx::migrate::Migrator::new(old.as_path())
+            .await
+            .unwrap()
+            .run(&pool)
+            .await
+            .unwrap();
+        for (id, body) in [("a", "legacy-a"), ("b", "legacy-b")] {
+            let payload = serde_json::to_string(&Item {
+                id: id.into(),
+                body: body.into(),
+            })
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO objects (kind, id, payload, created_at, updated_at)
+                 VALUES ('raw_item', ?1, ?2, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool.close().await;
+        std::fs::remove_dir_all(&old).ok();
+
+        // The restart applies 0003: the rows survive but no tenant sees them.
+        let store = Store::open(&path).await.unwrap();
+        let ws = "019e5f3f-ab10-7451-8455-6f3807545eb9";
+        let tenant = store.scoped(ws, None);
+        let body = |i: Option<Item>| i.map(|i| i.body);
+        assert_eq!(body(tenant.get("raw_item", "a").await.unwrap()), None);
+        assert_eq!(
+            body(store.get("raw_item", "a").await.unwrap()).as_deref(),
+            Some("legacy-a"),
+            "0003 keeps the row in the unscoped namespace"
+        );
+        // Written by the tenant after the upgrade, before the backfill ran.
+        tenant
+            .put(
+                "raw_item",
+                "b",
+                &Item {
+                    id: "b".into(),
+                    body: "tenant-b".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        sqlx::query(&ADOPT.replace("<workspace-uuid>", ws))
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let left: Vec<(String, String)> =
+            sqlx::query_as(LEFT).fetch_all(store.pool()).await.unwrap();
+
+        assert_eq!(
+            body(tenant.get("raw_item", "a").await.unwrap()).as_deref(),
+            Some("legacy-a")
+        );
+        assert_eq!(
+            body(
+                store
+                    .scoped(ws, Some("p1"))
+                    .get("raw_item", "a")
+                    .await
+                    .unwrap()
+            )
+            .as_deref(),
+            Some("legacy-a"),
+            "an adopted row is workspace-wide"
+        );
+        assert_eq!(
+            body(tenant.get("raw_item", "b").await.unwrap()).as_deref(),
+            Some("tenant-b"),
+            "the backfill never overwrites the tenant's own row"
+        );
+        assert_eq!(left, [("raw_item".to_owned(), "b".to_owned())]);
+        assert!(
+            store
+                .scoped("other-ws", None)
+                .get::<Item>("raw_item", "a")
+                .await
+                .unwrap()
+                .is_none(),
+            "only the named workspace adopts the rows"
         );
         std::fs::remove_file(&path).ok();
     }
