@@ -110,10 +110,7 @@ pub async fn serve<H: McpHandler>(config: ServeConfig, handler: H) {
         handler,
     });
 
-    let app = Router::new()
-        .route("/healthz", get(healthz::<H>))
-        .route("/v1/mcp", post(mcp::<H>))
-        .with_state(state);
+    let app = router(state);
 
     let port =
         std::env::var(format!("{prefix}_PORT")).unwrap_or_else(|_| default_port.to_string());
@@ -124,6 +121,13 @@ pub async fn serve<H: McpHandler>(config: ServeConfig, handler: H) {
         .unwrap_or_else(|e| panic!("bind {addr}: {e}"));
     tracing::info!(%addr, tool, "listening");
     axum::serve(listener, app).await.expect("server error");
+}
+
+fn router<H: McpHandler>(state: Arc<ServeState<H>>) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz::<H>))
+        .route("/v1/mcp", post(mcp::<H>))
+        .with_state(state)
 }
 
 fn now_secs() -> i64 {
@@ -181,7 +185,7 @@ async fn mcp<H: McpHandler>(
 
     // MCP (JSON-RPC 2.0) is the only wire format — what Claude/Cursor and the
     // platform speak. The legacy `{method, params}` envelope is gone.
-    if req.get("jsonrpc").is_none() {
+    if !is_jsonrpc_2(&req) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "bad_request", "detail": "expected JSON-RPC 2.0 request"})),
@@ -195,12 +199,20 @@ async fn mcp<H: McpHandler>(
     }
 }
 
+/// The `jsonrpc` member is what makes a frame JSON-RPC 2.0: it must be exactly
+/// the string `"2.0"`, so a missing member, another version or another type
+/// never reaches the handler.
+fn is_jsonrpc_2(req: &serde_json::Value) -> bool {
+    req.get("jsonrpc").and_then(|v| v.as_str()) == Some("2.0")
+}
+
 /// MCP protocol revision this scaffold implements.
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// Handle one JSON-RPC frame. `None` = notification (nothing to send back).
 /// Protocol-level failures come back as JSON-RPC errors with HTTP 200, per
-/// the spec; only auth failures are HTTP errors.
+/// the spec; only transport failures (auth, a body that is not a JSON-RPC 2.0
+/// request) are HTTP errors, and those are decided in [`mcp`] before this runs.
 async fn rpc<H: McpHandler>(
     handler: &H,
     tool: &'static str,
@@ -251,6 +263,8 @@ async fn rpc<H: McpHandler>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     struct Fake;
@@ -333,5 +347,205 @@ mod tests {
             .unwrap();
         assert_eq!(failed["result"]["isError"], true);
         assert_eq!(failed["result"]["structuredContent"]["error"], "unknown_method");
+    }
+
+    const SECRET: &[u8] = b"test-secret";
+
+    /// Counts `dispatch` calls, so a test sees what actually reached the layer.
+    struct Counting {
+        dispatched: AtomicUsize,
+    }
+
+    impl McpHandler for Counting {
+        async fn dispatch(
+            &self,
+            claims: &Claims,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+            self.dispatched.fetch_add(1, Ordering::SeqCst);
+            Fake.dispatch(claims, method, params).await
+        }
+    }
+
+    /// The real router on a loopback port. `no_proxy`: the dev host proxies
+    /// loopback, and a request must reach this listener, not a proxy.
+    struct Wire {
+        state: Arc<ServeState<Counting>>,
+        url: String,
+        http: reqwest::Client,
+    }
+
+    impl Wire {
+        async fn start() -> Self {
+            let state = Arc::new(ServeState {
+                tool: "test",
+                version: "0.1.0".into(),
+                git_sha: "dev",
+                platform_secret: Some(SECRET.to_vec()),
+                handler: Counting {
+                    dispatched: AtomicUsize::new(0),
+                },
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = router(state.clone());
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            Self {
+                state,
+                url: format!("http://{addr}/v1/mcp"),
+                http: reqwest::Client::builder().no_proxy().build().unwrap(),
+            }
+        }
+
+        fn dispatched(&self) -> usize {
+            self.state.handler.dispatched.load(Ordering::SeqCst)
+        }
+
+        async fn post(
+            &self,
+            token: Option<&str>,
+            body: &serde_json::Value,
+        ) -> (u16, serde_json::Value) {
+            let mut req = self.http.post(&self.url).json(body);
+            if let Some(token) = token {
+                req = req.bearer_auth(token);
+            }
+            let resp = req.send().await.unwrap();
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap();
+            let body = if text.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_str(&text).unwrap()
+            };
+            (status, body)
+        }
+    }
+
+    fn token() -> String {
+        auth::mint(
+            SECRET,
+            &Claims {
+                workspace: "ws1".into(),
+                project: None,
+                tool: "test".into(),
+                exp: now_secs() + 60,
+            },
+        )
+    }
+
+    /// Every frame with the same version member: a request answered with a
+    /// result, a tool call that would reach the handler, a notification.
+    fn frames(version: Option<serde_json::Value>) -> Vec<serde_json::Value> {
+        let call = json!({"name": "test_echo", "arguments": {"x": 1}});
+        [
+            json!({"id": 1, "method": "ping"}),
+            json!({"id": 2, "method": "tools/call", "params": call}),
+            json!({"method": "notifications/initialized"}),
+        ]
+        .into_iter()
+        .map(|mut frame| {
+            if let Some(version) = &version {
+                frame["jsonrpc"] = version.clone();
+            }
+            frame
+        })
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn wrong_version_is_rejected_before_dispatch() {
+        let wire = Wire::start().await;
+        let token = token();
+        let cases = [
+            None,
+            Some(json!("1.0")),
+            Some(json!("2")),
+            Some(json!(" 2.0")),
+            Some(json!(null)),
+            Some(json!(2)),
+            Some(json!(2.0)),
+            Some(json!(["2.0"])),
+        ];
+        for version in cases {
+            for frame in frames(version) {
+                let (status, body) = wire.post(Some(&token), &frame).await;
+                assert_eq!(status, 400, "{frame}");
+                assert_eq!(body["error"], "bad_request", "{frame}");
+                assert!(body.get("result").is_none(), "{frame}");
+            }
+        }
+        assert_eq!(wire.dispatched(), 0);
+    }
+
+    #[tokio::test]
+    async fn valid_version_keeps_the_documented_contract() {
+        let wire = Wire::start().await;
+        let token = token();
+        let token = Some(token.as_str());
+
+        let [ping, call, notification] = <[_; 3]>::try_from(frames(Some(json!("2.0")))).unwrap();
+        let (status, body) = wire.post(token, &ping).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["result"], json!({}));
+        assert_eq!(wire.dispatched(), 0);
+
+        let (status, body) = wire.post(token, &call).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["result"]["isError"], false);
+        assert_eq!(body["result"]["structuredContent"]["echo"]["x"], 1);
+        assert_eq!(wire.dispatched(), 1);
+
+        let (status, body) = wire.post(token, &notification).await;
+        assert_eq!(status, 202);
+        assert_eq!(body, serde_json::Value::Null);
+
+        let list = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"});
+        let (status, body) = wire.post(token, &list).await;
+        assert_eq!(status, 200);
+        assert!(body["result"]["tools"].is_array());
+
+        // Tool failures stay a result and protocol faults stay JSON-RPC errors.
+        let failing = json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                             "params": {"name": "test_missing"}});
+        let (status, body) = wire.post(token, &failing).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["result"]["isError"], true);
+        assert_eq!(wire.dispatched(), 2);
+
+        let unknown = json!({"jsonrpc": "2.0", "id": 5, "method": "nope"});
+        let (status, body) = wire.post(token, &unknown).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["error"]["code"], -32601);
+
+        let nameless = json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call"});
+        let (status, body) = wire.post(token, &nameless).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn token_is_checked_before_the_version() {
+        let wire = Wire::start().await;
+        let good = frames(Some(json!("2.0"))).remove(0);
+        let wrong = frames(Some(json!("1.0"))).remove(0);
+        let forged = auth::mint(
+            b"other-secret",
+            &Claims {
+                workspace: "ws1".into(),
+                project: None,
+                tool: "test".into(),
+                exp: now_secs() + 60,
+            },
+        );
+        for frame in [&good, &wrong] {
+            for token in [None, Some("not-a-token"), Some(forged.as_str())] {
+                let (status, body) = wire.post(token, frame).await;
+                assert_eq!(status, 401, "{frame}");
+                assert_eq!(body["error"], "invalid_platform_token", "{frame}");
+            }
+        }
+        assert_eq!(wire.dispatched(), 0);
     }
 }
